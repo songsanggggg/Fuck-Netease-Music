@@ -1173,13 +1173,23 @@ app.whenReady().then(async () => {
   ipcMain.handle("native:call", async (_event, payload = {}) => {
     const startedAt = Date.now();
     try {
-      if (process.env.NETEASE_DEBUG_BOOT) {
+      if (
+        process.env.NETEASE_DEBUG_BOOT ||
+        /^download\.|^storage\.(querydownloadingprocess|startscandownload|checkfilesexist|addid3)/i.test(
+          String(payload.command || "")
+        )
+      ) {
         console.log("[native:call:start]", payload.command, JSON.stringify(summarizeValue(payload.args)));
       }
       const result = await nativeApi.invoke(payload.command, payload.args, {
         window: BrowserWindow.fromWebContents(_event.sender)
       });
-      if (process.env.NETEASE_DEBUG_BOOT) {
+      if (
+        process.env.NETEASE_DEBUG_BOOT ||
+        /^download\.|^storage\.(querydownloadingprocess|startscandownload|checkfilesexist|addid3)/i.test(
+          String(payload.command || "")
+        )
+      ) {
         console.log(
           "[native:call:ok]",
           payload.command,

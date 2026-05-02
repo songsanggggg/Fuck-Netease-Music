@@ -4,6 +4,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 const { pathToFileURL } = require("node:url");
 
 const registeredCallbacks = new Map();
+const debugEventCounters = new Map();
 const bootstrapLocalStorageDefaults = {
   setting: {
     downloadDir: "",
@@ -51,18 +52,326 @@ function invokeNative(command, args) {
   return ipcRenderer.invoke("native:call", { command, args });
 }
 
+function toBridgeEventName(name, namespace) {
+  const normalizedName = String(name || "").trim();
+  const normalizedNamespace = String(namespace || "").trim();
+  if (!normalizedName) {
+    return "";
+  }
+  if (normalizedName.includes(".")) {
+    return normalizedName;
+  }
+  if (!normalizedNamespace) {
+    return normalizedName;
+  }
+  return `${normalizedNamespace}.${normalizedName.startsWith("on") ? normalizedName : `on${normalizedName}`}`;
+}
+
+function buildBridgeEventAliases(name) {
+  const normalizedName = String(name || "").trim();
+  if (!normalizedName) {
+    return [];
+  }
+
+  const aliasSet = new Set([normalizedName, normalizedName.toLowerCase()]);
+  const [namespace = "", rawEventName = ""] = normalizedName.split(".");
+  const eventName = String(rawEventName || "").trim();
+  const normalizedNamespace = String(namespace || "").trim();
+
+  if (!normalizedNamespace || !eventName) {
+    return Array.from(aliasSet);
+  }
+
+  const withoutOnPrefix = eventName.replace(/^on/i, "");
+  const decapitalize = (value) =>
+    value ? `${value.charAt(0).toLowerCase()}${value.slice(1)}` : value;
+  const capitalize = (value) =>
+    value ? `${value.charAt(0).toUpperCase()}${value.slice(1)}` : value;
+
+  const eventVariants = new Set([
+    eventName,
+    eventName.toLowerCase(),
+    decapitalize(eventName),
+    capitalize(eventName),
+    withoutOnPrefix,
+    withoutOnPrefix.toLowerCase(),
+    decapitalize(withoutOnPrefix),
+    capitalize(withoutOnPrefix)
+  ]);
+
+  for (const variant of eventVariants) {
+    if (!variant) {
+      continue;
+    }
+    aliasSet.add(`${normalizedNamespace}.${variant}`);
+    aliasSet.add(`${normalizedNamespace}.${String(variant).toLowerCase()}`);
+    aliasSet.add(`${variant}.${normalizedNamespace}`);
+    aliasSet.add(`${String(variant).toLowerCase()}.${normalizedNamespace}`);
+    aliasSet.add(variant);
+    aliasSet.add(String(variant).toLowerCase());
+  }
+
+  return Array.from(aliasSet);
+}
+
+function resolveRegisteredCallbacks(name) {
+  const matches = [];
+  const seen = new Set();
+
+  for (const alias of buildBridgeEventAliases(name)) {
+    if (!alias || seen.has(alias)) {
+      continue;
+    }
+    seen.add(alias);
+
+    const handler = registeredCallbacks.get(alias);
+    if (!handler) {
+      continue;
+    }
+
+    matches.push({
+      handler,
+      matchedName: alias
+    });
+  }
+
+  return matches;
+}
+
+function normalizeDownloadProcessPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return payload;
+  }
+
+  const down = Number(payload.down ?? payload.download ?? 0);
+  const total = Number(payload.total ?? 0);
+  const speed = Number(payload.speed ?? 0);
+  const nativeType = Number(payload.type ?? 0);
+  const normalizedType =
+    nativeType === 1 && !Boolean(payload.isLast) && total > 0 && down < total ? 0 : nativeType;
+
+  return {
+    ...payload,
+    nativeType,
+    type: normalizedType,
+    down,
+    download: down,
+    total,
+    speed,
+    path: payload.path || payload.relativePath || "",
+    relativePath: payload.relativePath || payload.path || ""
+  };
+}
+
+function shouldLogLimitedDebug(key, limit = 8) {
+  const next = (debugEventCounters.get(key) || 0) + 1;
+  debugEventCounters.set(key, next);
+  return next <= limit;
+}
+
+function buildDownloadProcessCallbackVariants(args) {
+  if (!Array.isArray(args) || args.length === 0) {
+    return [args];
+  }
+
+  const payload = normalizeDownloadProcessPayload(args[0]);
+  if (!payload || typeof payload !== "object") {
+    return [args];
+  }
+
+  return [[
+    payload,
+    payload,
+    payload.id,
+    payload.type,
+    Boolean(payload.isLast),
+    payload.relativePath,
+    payload.down,
+    payload.total,
+    payload.speed,
+    payload.path,
+    payload.nativeType
+  ]];
+}
+
+function buildRegisteredCallbackArgs(name, matchedName, args) {
+  if (name !== "download.onProcess") {
+    return [args];
+  }
+
+  return buildDownloadProcessCallbackVariants(args);
+}
+
+function parseDownloadOfflineId(offlineId) {
+  const match = String(offlineId || "").match(/^(track|voice|mv)-(.+)$/);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    resourceType: match[1],
+    resourceId: match[2]
+  };
+}
+
+function resolveDownloadResourceRecord(state, offlineId) {
+  const downloadState = state?.download;
+  const parsed = parseDownloadOfflineId(offlineId);
+  if (!downloadState || !parsed) {
+    return null;
+  }
+
+  const mapByType = {
+    track: downloadState.trackMap,
+    voice: downloadState.voiceMap,
+    mv: downloadState.mvMap
+  };
+  const targetMap = mapByType[parsed.resourceType];
+  if (!targetMap || typeof targetMap.get !== "function") {
+    return null;
+  }
+
+  return targetMap.get(parsed.resourceId) || null;
+}
+
+function shouldDispatchDownloadFallback(payload) {
+  const parsed = parseDownloadOfflineId(payload?.id);
+  if (!parsed) {
+    return false;
+  }
+
+  const store = resolveAppStore();
+  if (!store || typeof store.getState !== "function") {
+    return false;
+  }
+
+  const state = store.getState() || {};
+  const resource = resolveDownloadResourceRecord(state, payload.id);
+  const progress = Number(resource?.download?.progress ?? 0);
+  const speed = Number(resource?.download?.speed ?? 0);
+  const hasPath = Boolean(resource?.path);
+
+  if (payload.isLast) {
+    return !hasPath && progress < 0.9;
+  }
+
+  if (payload.down > 0 && payload.total > 0) {
+    return progress <= 0 && speed <= 0;
+  }
+
+  return false;
+}
+
+function dispatchDownloadFallback(payload) {
+  const store = resolveAppStore();
+  if (!store || typeof store.dispatch !== "function") {
+    return false;
+  }
+
+  try {
+    store.dispatch({
+      type: "download/onDownload",
+      payload
+    });
+
+    if (shouldLogLimitedDebug("download.onProcess:fallback")) {
+      console.log(
+        "[bridge:event:download-fallback-dispatch]",
+        JSON.stringify({
+          id: payload.id,
+          type: payload.type,
+          nativeType: payload.nativeType,
+          isLast: Boolean(payload.isLast),
+          down: payload.down,
+          total: payload.total,
+          speed: payload.speed
+        })
+      );
+    }
+    return true;
+  } catch (error) {
+    console.error("[bridge:event:download-fallback-error]", error);
+    return false;
+  }
+}
+
 function runRegisteredCallbacks(name, args) {
-  const handler = registeredCallbacks.get(name);
-  if (!handler) {
+  const matches = resolveRegisteredCallbacks(name);
+  if (matches.length === 0) {
+    if (/^download\.|^storage\./.test(String(name || ""))) {
+      console.log("[bridge:event:miss]", name, Array.isArray(args) ? args.length : 0);
+    }
     return;
   }
 
-  const callbackList = Array.isArray(handler) ? handler : [handler];
-  for (const callback of callbackList) {
-    try {
-      callback(...args);
-    } catch (error) {
-      console.error("[native:event]", name, error);
+  if (/^download\.|^storage\./.test(String(name || ""))) {
+    console.log(
+      "[bridge:event:dispatch]",
+      name,
+      matches.reduce((total, entry) => {
+        const callbackList = Array.isArray(entry.handler) ? entry.handler : [entry.handler];
+        return total + callbackList.length;
+      }, 0),
+      matches.map((entry) => entry.matchedName).join(",") || name
+    );
+  }
+
+  for (const { handler, matchedName } of matches) {
+    const callbackList = Array.isArray(handler) ? handler : [handler];
+
+    for (const callback of callbackList) {
+      const variants = buildRegisteredCallbackArgs(name, matchedName, args);
+      let lastError = null;
+
+      for (const variantArgs of variants) {
+        try {
+          if (name === "download.onProcess" && shouldLogLimitedDebug("download.onProcess:variant")) {
+            const payload = variantArgs[0];
+            console.log(
+              "[bridge:event:download-variant]",
+              matchedName,
+              Array.isArray(variantArgs) ? variantArgs.length : 0,
+              typeof payload,
+              payload && typeof payload === "object"
+                ? JSON.stringify({
+                    id: payload.id,
+                    type: payload.type,
+                    nativeType: payload.nativeType,
+                    isLast: Boolean(payload.isLast),
+                    down: payload.down,
+                    total: payload.total,
+                    speed: payload.speed,
+                    path: payload.path
+                  })
+                : String(payload)
+            );
+          }
+          callback(...variantArgs);
+          lastError = null;
+          break;
+        } catch (error) {
+          if (name === "download.onProcess" && shouldLogLimitedDebug("download.onProcess:error")) {
+            console.error(
+              "[bridge:event:download-callback-error]",
+              matchedName,
+              Array.isArray(variantArgs) ? variantArgs.length : 0,
+              error
+            );
+          }
+          lastError = error;
+        }
+      }
+
+      if (lastError) {
+        console.error("[native:event]", name, lastError);
+      }
+    }
+  }
+
+  if (name === "download.onProcess") {
+    const payload = normalizeDownloadProcessPayload(args[0]);
+    if (payload && typeof payload === "object" && shouldDispatchDownloadFallback(payload)) {
+      dispatchDownloadFallback(payload);
     }
   }
 }
@@ -935,12 +1244,40 @@ function installFetchBridge() {
 }
 
 function resolveWebpackRequire() {
-  return typeof window.__webpack_require__ === "function" ? window.__webpack_require__ : null;
+  if (typeof window.__webpack_require__ === "function") {
+    return window.__webpack_require__;
+  }
+
+  return null;
 }
 
 function readStoreFromCandidate(candidate) {
   if (!candidate || typeof candidate !== "object") {
     return null;
+  }
+
+  if (
+    typeof candidate.getStore === "function" &&
+    typeof candidate.getDispatch === "function"
+  ) {
+    try {
+      const sampleState = candidate.getStore();
+      const sampleDispatch = candidate.getDispatch();
+      if (
+        sampleState &&
+        typeof sampleState === "object" &&
+        typeof sampleDispatch === "function"
+      ) {
+        return {
+          getState() {
+            return candidate.getStore() || {};
+          },
+          dispatch(action) {
+            return candidate.getDispatch()(action);
+          }
+        };
+      }
+    } catch {}
   }
 
   const possibleStores = [
@@ -1303,6 +1640,96 @@ function installReactDomProbe() {
 
 const localAudioBridge = createLocalAudioBridge();
 
+const bridge = {
+  call(name, ...args) {
+    return invokeNative(name, args).then((result) => {
+      if (
+        result &&
+        typeof result === "object" &&
+        Array.isArray(result.__nativeCallbackArgs)
+      ) {
+        return normalizeBridgeValue(result.__nativeCallbackArgs[0]);
+      }
+      return normalizeBridgeValue(result);
+    });
+  },
+  fillRegisterCallIfEmpty(name, namespace, callback) {
+    const eventName = toBridgeEventName(name, namespace);
+    if (!eventName || typeof callback !== "function" || registeredCallbacks.has(eventName)) {
+      return false;
+    }
+    if (/^download\.|^storage\./.test(eventName)) {
+      console.log("[bridge:register:fill]", eventName);
+    }
+    registeredCallbacks.set(eventName, callback);
+    return true;
+  },
+  overwriteRegisterCall(name, namespace, callback) {
+    const eventName = toBridgeEventName(name, namespace);
+    if (!eventName || typeof callback !== "function") {
+      return false;
+    }
+    if (/^download\.|^storage\./.test(eventName)) {
+      console.log("[bridge:register:overwrite]", eventName);
+    }
+    registeredCallbacks.set(eventName, callback);
+    return true;
+  },
+  appendRegisterCall(name, namespace, callback) {
+    const eventName = toBridgeEventName(name, namespace);
+    if (!eventName || typeof callback !== "function") {
+      return false;
+    }
+    if (/^download\.|^storage\./.test(eventName)) {
+      console.log("[bridge:register:append]", eventName);
+    }
+    const existing = registeredCallbacks.get(eventName);
+    if (!existing) {
+      registeredCallbacks.set(eventName, callback);
+      return true;
+    }
+    if (Array.isArray(existing)) {
+      existing.push(callback);
+      return true;
+    }
+    registeredCallbacks.set(eventName, [existing, callback]);
+    return true;
+  },
+  removeRegisterCall(name, namespace, callback) {
+    const eventName = toBridgeEventName(name, namespace);
+    if (!eventName) {
+      return false;
+    }
+    if (/^download\.|^storage\./.test(eventName)) {
+      console.log("[bridge:register:remove]", eventName);
+    }
+    const existing = registeredCallbacks.get(eventName);
+    if (!existing) {
+      return false;
+    }
+    if (!callback) {
+      registeredCallbacks.delete(eventName);
+      return true;
+    }
+    if (Array.isArray(existing)) {
+      const next = existing.filter((entry) => entry !== callback);
+      if (next.length === 0) {
+        registeredCallbacks.delete(eventName);
+      } else if (next.length === 1) {
+        registeredCallbacks.set(eventName, next[0]);
+      } else {
+        registeredCallbacks.set(eventName, next);
+      }
+      return true;
+    }
+    if (existing === callback) {
+      registeredCallbacks.delete(eventName);
+      return true;
+    }
+    return false;
+  }
+};
+
 const channel = {
   call(name, callback, argsLike) {
     const args = Array.isArray(argsLike) ? argsLike : Array.from(argsLike || []);
@@ -1346,6 +1773,9 @@ const channel = {
   registerCall(name, callback) {
     if (!name || typeof callback !== "function") {
       return false;
+    }
+    if (/^download\.|^storage\./.test(String(name))) {
+      console.log("[channel:register]", name);
     }
 
     const existing = registeredCallbacks.get(name);
@@ -1397,10 +1827,16 @@ const channel = {
   }
 };
 
+// The app runtime may try to wrap registerCall with a legacy stub layer.
+// Keep the original multi-listener behavior from preload instead.
+channel.registerCall.__HACKED__ = true;
+
 window.channel = channel;
+window.Bridge = bridge;
 window.__NETEASE_LINUX_PORT__ = {
   channel,
-  invokeNative
+  invokeNative,
+  Bridge: bridge
 };
 
 seedLocalStorageDefaults();
@@ -1429,4 +1865,5 @@ window.addEventListener("unhandledrejection", (event) => {
 
 if (process.contextIsolated) {
   contextBridge.exposeInMainWorld("channel", channel);
+  contextBridge.exposeInMainWorld("Bridge", bridge);
 }

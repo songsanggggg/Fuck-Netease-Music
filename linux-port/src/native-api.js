@@ -868,6 +868,8 @@ function createNativeApi(options) {
   let invocationWindow = null;
   let persistedHostCache = null;
   let persistentModelTableColumnsCache = null;
+  const activeDownloads = new Map();
+  const copyNcmSubscribers = new Set();
 
   if (fs.existsSync(localConfigPath)) {
     localConfig = safeJsonParse(fs.readFileSync(localConfigPath, "utf8"), {});
@@ -1541,6 +1543,462 @@ function createNativeApi(options) {
     const normalizedContents = maybeRepairUtf8Mojibake(String(contents || ""));
     await fsp.writeFile(targetPath, normalizedContents, "utf8");
     return normalizedContents;
+  }
+
+  function normalizeRelativeDownloadPath(targetPath = "") {
+    return String(targetPath || "")
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "")
+      .trim();
+  }
+
+  function resolveDownloadFilePath(baseDir, relativePath) {
+    const normalizedRelativePath = normalizeRelativeDownloadPath(relativePath);
+    if (!normalizedRelativePath) {
+      return null;
+    }
+    const resolvedBaseDir = path.resolve(String(baseDir || app.getPath("downloads")));
+    const candidatePath = path.resolve(path.join(resolvedBaseDir, normalizedRelativePath));
+    if (!isSubPath(resolvedBaseDir, candidatePath)) {
+      return null;
+    }
+    return candidatePath;
+  }
+
+  async function buildDownloadHeaders(targetUrl, extHeaderText = "") {
+    const normalizedUrl = normalizeAssetUrl(String(targetUrl || ""));
+    const headers = {
+      Origin: "https://music.163.com",
+      origin: "https://music.163.com",
+      Referer: "https://music.163.com/",
+      referer: "https://music.163.com/",
+      Accept: "*/*"
+    };
+
+    const extHeaders = safeJsonParse(String(extHeaderText || ""), {});
+    if (extHeaders && typeof extHeaders === "object" && !Array.isArray(extHeaders)) {
+      for (const [key, value] of Object.entries(extHeaders)) {
+        if (value !== undefined && value !== null && value !== "") {
+          headers[key] = String(value);
+        }
+      }
+    }
+
+    if (normalizedUrl) {
+      const cookies = await session.defaultSession.cookies.get({ url: normalizedUrl });
+      if (cookies.length > 0) {
+        headers.Cookie = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+      }
+    }
+
+    return headers;
+  }
+
+  function getDownloadStateSnapshot(task) {
+    const totalBytes = task.totalBytes > 0 ? task.totalBytes : Math.max(task.expectedBytes || 0, 1);
+    const downloadedBytes = Math.max(0, task.downloadedBytes || 0);
+    const progress = Math.min(1, totalBytes > 0 ? downloadedBytes / totalBytes : 0);
+    return {
+      id: task.id,
+      download: downloadedBytes,
+      total: totalBytes,
+      speed: Math.max(0, Math.round(task.speedBytesPerSecond || 0)),
+      path: task.relativePath,
+      progress
+    };
+  }
+
+  function emitDownloadProcess(task, extra = {}) {
+    const snapshot = getDownloadStateSnapshot(task);
+    const eventPayload = {
+      id: task.id,
+      type: extra.type ?? 1,
+      isLast: Boolean(extra.isLast),
+      download: snapshot.download,
+      total: snapshot.total,
+      speed: snapshot.speed,
+      path: extra.path || snapshot.path,
+      relativePath: snapshot.path
+    };
+    logger.log("[native:download:process]", JSON.stringify(eventPayload));
+    emitNativeEvent("download.onProcess", eventPayload);
+  }
+
+  async function moveFileIfNeeded(sourcePath, targetPath) {
+    if (!sourcePath || !targetPath || sourcePath === targetPath) {
+      return targetPath || sourcePath || "";
+    }
+    await ensureDir(path.dirname(targetPath));
+    await fsp.rename(sourcePath, targetPath);
+    return targetPath;
+  }
+
+  async function performNativeDownload(task) {
+    let response;
+    let fileHandle;
+    let fileStream;
+    try {
+      const headers = await buildDownloadHeaders(task.url, task.extHeader);
+      response = await fetch(task.url, {
+        method: "GET",
+        headers,
+        signal: task.abortController.signal
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`download failed: ${response.status}`);
+      }
+
+      const contentLength = Number(response.headers.get("content-length") || 0);
+      if (contentLength > 0) {
+        task.totalBytes = contentLength;
+      }
+
+      await ensureDir(path.dirname(task.filePath));
+      fileHandle = await fsp.open(task.filePath, "w");
+      fileStream = fileHandle.createWriteStream();
+
+      const reader = response.body.getReader();
+      let previousBytes = 0;
+      let previousTime = Date.now();
+      task.status = "downloading";
+      task.downloadedBytes = 0;
+      task.speedBytesPerSecond = 0;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        const chunk = Buffer.from(value);
+        await new Promise((resolve, reject) => {
+          fileStream.write(chunk, (error) => (error ? reject(error) : resolve()));
+        });
+        task.downloadedBytes += chunk.length;
+        const now = Date.now();
+        const elapsed = Math.max(1, now - previousTime);
+        if (elapsed >= 500) {
+          task.speedBytesPerSecond = ((task.downloadedBytes - previousBytes) * 1000) / elapsed;
+          previousBytes = task.downloadedBytes;
+          previousTime = now;
+          emitDownloadProcess(task);
+        }
+      }
+
+      await new Promise((resolve, reject) => {
+        fileStream.end((error) => (error ? reject(error) : resolve()));
+      });
+      await fileHandle.close();
+      fileHandle = null;
+      fileStream = null;
+
+      task.speedBytesPerSecond = 0;
+      task.totalBytes = Math.max(task.totalBytes || 0, task.downloadedBytes || 0, 1);
+      task.status = "completed";
+      emitDownloadProcess(task, {
+        type: 0,
+        isLast: true,
+        path: task.relativePath
+      });
+      return { ok: true, id: task.id, path: task.relativePath };
+    } catch (error) {
+      const isAbort = error && (error.name === "AbortError" || /aborted/i.test(String(error.message || "")));
+      if (fileStream) {
+        try {
+          await new Promise((resolve) => fileStream.end(resolve));
+        } catch {
+          // ignore cleanup failure
+        }
+      }
+      if (fileHandle) {
+        try {
+          await fileHandle.close();
+        } catch {
+          // ignore cleanup failure
+        }
+      }
+
+      if (task.status === "cancelled") {
+        try {
+          await fsp.rm(task.filePath, { force: true });
+        } catch {
+          // ignore cleanup failure
+        }
+        return { ok: true, id: task.id, cancelled: true };
+      }
+      if (task.status === "paused" || isAbort) {
+        return { ok: true, id: task.id, paused: true };
+      }
+
+      logger.warn("[native:download]", task.id, error && error.message ? error.message : error);
+      emitDownloadProcess(task, {
+        type: -101,
+        isLast: true,
+        path: task.relativePath
+      });
+      return { ok: false, id: task.id, error: error && error.message ? error.message : String(error) };
+    } finally {
+      activeDownloads.delete(task.id);
+    }
+  }
+
+  async function startNativeDownload(rawPayload = {}) {
+    const payload = normalizeDownloadPayloadArgs(rawPayload);
+    const downloadDir =
+      normalizeStorageTarget(payload.downloadDir) ||
+      normalizeStorageTarget(payload.basePath) ||
+      app.getPath("downloads");
+    const relativePath = normalizeRelativeDownloadPath(
+      payload.relativePath || payload.prePath || `${payload.id || "download"}${guessFileExtensionFromUrl(payload.url)}`
+    );
+    const filePath = resolveDownloadFilePath(downloadDir, relativePath);
+    if (!payload.url || !filePath) {
+      throw new Error("invalid download payload");
+    }
+
+    logger.log(
+      "[native:download:start]",
+      JSON.stringify({
+        id: String(payload.id || ""),
+        relativePath,
+        filePath,
+        hasExtHeader: Boolean(payload.extHeader),
+        size: Number(payload.size || 0),
+        payloadKeys: Object.keys(payload).sort()
+      })
+    );
+
+    const currentTask = activeDownloads.get(String(payload.id || ""));
+    if (currentTask) {
+      currentTask.abortController.abort();
+      activeDownloads.delete(currentTask.id);
+    }
+
+    const task = {
+      id: String(payload.id || `download-${Date.now()}`),
+      url: normalizeAssetUrl(String(payload.url || "")),
+      relativePath,
+      filePath,
+      extHeader: String(payload.extHeader || ""),
+      expectedBytes: Number(payload.size || 0),
+      totalBytes: Number(payload.size || 0),
+      downloadedBytes: 0,
+      speedBytesPerSecond: 0,
+      status: "queued",
+      abortController: new AbortController()
+    };
+
+    activeDownloads.set(task.id, task);
+    task.promise = performNativeDownload(task);
+    return { ok: true, id: task.id };
+  }
+
+  async function downloadFileOnce(rawPayload = {}) {
+    const payload = normalizeDownloadPayloadArgs(rawPayload);
+    const relativePath = normalizeRelativeDownloadPath(
+      payload.relativePath || payload.pathId || `${payload.id || "download-sync"}${guessFileExtensionFromUrl(payload.url)}`
+    );
+    const downloadDir =
+      normalizeStorageTarget(payload.downloadDir) ||
+      normalizeStorageTarget(payload.basePath) ||
+      app.getPath("downloads");
+    const filePath = resolveDownloadFilePath(downloadDir, relativePath);
+    if (!payload.url || !filePath) {
+      return { type: -101, path: relativePath };
+    }
+
+    const headers = await buildDownloadHeaders(payload.url, payload.extHeader);
+    const response = await fetch(payload.url, {
+      method: "GET",
+      headers
+    });
+    if (!response.ok) {
+      return { type: -101, path: relativePath };
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    await ensureDir(path.dirname(filePath));
+    await fsp.writeFile(filePath, bytes);
+    return { type: 0, path: relativePath };
+  }
+
+  async function listDownloadFilesForScan(baseDir, excludePathList = []) {
+    const normalizedBaseDir = String(baseDir || app.getPath("downloads"));
+    const excluded = new Set(
+      (Array.isArray(excludePathList) ? excludePathList : [])
+        .map((entry) => normalizeRelativeDownloadPath(String(entry || "")))
+        .filter(Boolean)
+    );
+    const results = [];
+
+    async function walk(currentDir) {
+      let entries = [];
+      try {
+        entries = await fsp.readdir(currentDir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      for (const entry of entries) {
+        const entryPath = path.join(currentDir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(entryPath);
+          continue;
+        }
+
+        const relativePath = normalizeRelativeDownloadPath(path.relative(normalizedBaseDir, entryPath));
+        if (!relativePath || excluded.has(relativePath)) {
+          continue;
+        }
+
+        let stat;
+        try {
+          stat = await fsp.stat(entryPath);
+        } catch {
+          continue;
+        }
+
+        results.push({
+          path: relativePath,
+          size: stat.size,
+          creationTime: stat.mtimeMs,
+          comment: ""
+        });
+      }
+    }
+
+    await walk(normalizedBaseDir);
+    return results;
+  }
+
+  function getDownloadTaskByPayload(payload = {}) {
+    const id =
+      typeof payload === "string"
+        ? payload
+        : typeof payload?.id === "string"
+          ? payload.id
+          : typeof payload?.downloadId === "string"
+            ? payload.downloadId
+            : "";
+    return id ? activeDownloads.get(id) : null;
+  }
+
+  function flattenInvokeArgs(argsLike = []) {
+    const source = Array.isArray(argsLike) ? argsLike : [argsLike];
+    const flattened = [];
+    for (const entry of source) {
+      if (Array.isArray(entry)) {
+        flattened.push(...flattenInvokeArgs(entry));
+      } else {
+        flattened.push(entry);
+      }
+    }
+    return flattened;
+  }
+
+  function normalizeDownloadPayloadArgs(argsLike = []) {
+    const args = flattenInvokeArgs(argsLike);
+    const objectArgs = args.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry));
+    const mergedObject = Object.assign({}, ...objectArgs);
+
+    const idCandidate =
+      mergedObject.id ||
+      mergedObject.downloadId ||
+      (typeof args[0] === "string" ? args[0] : "") ||
+      "";
+
+    const urlCandidate =
+      mergedObject.url ||
+      mergedObject.downloadUrl ||
+      mergedObject.musicurl ||
+      "";
+
+    const relativePathCandidate =
+      mergedObject.relativePath ||
+      mergedObject.rel_path ||
+      mergedObject.relPath ||
+      mergedObject.path ||
+      mergedObject.targetPath ||
+      mergedObject.filePath ||
+      mergedObject.finalPath ||
+      "";
+
+    const extHeaderCandidate =
+      mergedObject.extHeader ||
+      mergedObject.ext_header ||
+      mergedObject.headers ||
+      mergedObject.extraHeader ||
+      "";
+
+    const sizeCandidate =
+      mergedObject.size ||
+      mergedObject.total ||
+      mergedObject.contentLength ||
+      0;
+
+    const prePathCandidate =
+      mergedObject.prePath ||
+      mergedObject.pre_path ||
+      mergedObject.tmpPath ||
+      "";
+
+    return {
+      ...mergedObject,
+      id: String(idCandidate || ""),
+      url: String(urlCandidate || ""),
+      relativePath: String(relativePathCandidate || ""),
+      prePath: String(prePathCandidate || ""),
+      extHeader:
+        typeof extHeaderCandidate === "string"
+          ? extHeaderCandidate
+          : extHeaderCandidate && typeof extHeaderCandidate === "object"
+            ? JSON.stringify(extHeaderCandidate)
+            : "",
+      size: Number(sizeCandidate || 0)
+    };
+  }
+
+  function normalizeStorageCheckFilesExistArgs(argsLike = []) {
+    const args = flattenInvokeArgs(argsLike);
+    const [firstArg, secondArg, thirdArg] = args;
+    if (firstArg && typeof firstArg === "object" && !Array.isArray(firstArg)) {
+      return {
+        files: Array.isArray(firstArg.files) ? firstArg.files : [],
+        baseDir: String(firstArg.path || thirdArg || app.getPath("downloads"))
+      };
+    }
+    return {
+      files: Array.isArray(secondArg) ? secondArg : Array.isArray(firstArg) ? firstArg : [],
+      baseDir: String(thirdArg || app.getPath("downloads"))
+    };
+  }
+
+  function normalizeDownloadProcessQueryArgs(argsLike = []) {
+    const args = flattenInvokeArgs(argsLike);
+    const [firstArg, secondArg] = args;
+    if (Array.isArray(firstArg)) {
+      return firstArg;
+    }
+    if (firstArg && typeof firstArg === "object" && Array.isArray(firstArg.items)) {
+      return firstArg.items;
+    }
+    if (Array.isArray(secondArg)) {
+      return secondArg;
+    }
+    return [];
+  }
+
+  function normalizeStartScanDownloadArgs(argsLike = []) {
+    const args = flattenInvokeArgs(argsLike);
+    const [firstArg, secondArg, thirdArg] = args;
+    if (firstArg && typeof firstArg === "object" && !Array.isArray(firstArg)) {
+      return {
+        path: String(firstArg.path || app.getPath("downloads")),
+        excludePath: Array.isArray(firstArg.excludePath) ? firstArg.excludePath : []
+      };
+    }
+    return {
+      path: String((typeof secondArg === "string" ? secondArg : thirdArg) || firstArg || app.getPath("downloads")),
+      excludePath: Array.isArray(thirdArg) ? thirdArg : Array.isArray(secondArg) ? secondArg : []
+    };
   }
 
   async function deleteTarget(targetPath) {
@@ -2250,6 +2708,122 @@ function createNativeApi(options) {
       await ensureDir(targetPath);
       return true;
     },
+    "storage.checkfilesexist": async (...args) => {
+      const { files, baseDir } = normalizeStorageCheckFilesExistArgs(args);
+      const resolvedBaseDir = normalizeStorageTarget(baseDir) || baseDir;
+
+      const results = [];
+      for (const file of files) {
+        const fileId = String(file?.id || "");
+        const rawPath = String(file?.path || "");
+        let candidatePath = resolveDownloadFilePath(resolvedBaseDir, rawPath);
+        if (!candidatePath && path.isAbsolute(rawPath)) {
+          candidatePath = rawPath;
+        }
+        if (!candidatePath && rawPath) {
+          candidatePath = resolveDownloadFilePath(resolvedBaseDir, rawPath.replace(/^\/+/, ""));
+        }
+        const exist = candidatePath ? await pathExists(candidatePath) : false;
+        results.push({
+          id: fileId,
+          path: rawPath,
+          exist
+        });
+      }
+      return results;
+    },
+    "storage.addid3": async (payload = {}) => {
+      const downloadDir =
+        normalizeStorageTarget(payload.downloadDir) ||
+        normalizeStorageTarget(payload.basePath) ||
+        app.getPath("downloads");
+      const sourceRelativePath = normalizeRelativeDownloadPath(payload.path || "");
+      const targetRelativePath = normalizeRelativeDownloadPath(
+        payload.finalPath || payload.newRelativePath || payload.relativePath || payload.path || ""
+      );
+      const sourcePath = resolveDownloadFilePath(downloadDir, sourceRelativePath);
+      const targetPath = resolveDownloadFilePath(downloadDir, targetRelativePath);
+
+      if (!sourcePath) {
+        return { status: false, path: payload.path || "" };
+      }
+      if (!(await pathExists(sourcePath))) {
+        return { status: false, path: sourceRelativePath };
+      }
+
+      const finalPath = await moveFileIfNeeded(sourcePath, targetPath || sourcePath);
+      return {
+        status: true,
+        path: normalizeRelativeDownloadPath(path.relative(downloadDir, finalPath))
+      };
+    },
+    "storage.querydownloadingprocess": async (...args) => {
+      const inputItems = normalizeDownloadProcessQueryArgs(args);
+      return inputItems.map((entry) => {
+        const task = activeDownloads.get(String(entry?.id || ""));
+        if (!task) {
+          return {
+            id: String(entry?.id || ""),
+            path: String(entry?.path || ""),
+            progress: 0
+          };
+        }
+        const snapshot = getDownloadStateSnapshot(task);
+        return {
+          id: task.id,
+          path: entry?.path || task.relativePath,
+          progress: snapshot.progress,
+          download: snapshot.download,
+          total: snapshot.total,
+          speed: snapshot.speed
+        };
+      });
+    },
+    "storage.startscandownload": async (...args) => {
+      const { path: baseDir, excludePath } = normalizeStartScanDownloadArgs(args);
+      const entries = await listDownloadFilesForScan(baseDir, excludePath);
+      logger.log(
+        "[native:download:scan]",
+        JSON.stringify({
+          path: baseDir,
+          excludeCount: excludePath.length,
+          found: entries.length
+        })
+      );
+      emitNativeEvent("storage.ondownloadscan", entries);
+      return entries;
+    },
+    "storage.subscribecopyncmprocess": async (payload = {}) => {
+      if (typeof payload?.callback === "function") {
+        copyNcmSubscribers.add(payload.callback);
+      }
+      return true;
+    },
+    "storage.copyncm": async (payload = {}) => {
+      const srcFiles = Array.isArray(payload?.srcFiles) ? payload.srcFiles : [];
+      const destFiles = Array.isArray(payload?.destFiles) ? payload.destFiles : [];
+      const copied = [];
+      for (let index = 0; index < Math.min(srcFiles.length, destFiles.length); index += 1) {
+        const src = String(srcFiles[index] || "");
+        const dst = String(destFiles[index] || "");
+        if (!src || !dst) {
+          continue;
+        }
+        await ensureDir(path.dirname(dst));
+        await fsp.copyFile(src, dst);
+        const eventPayload = { type: "copyncm", code: 0, src, dst };
+        copied.push(eventPayload);
+        emitNativeEvent("storage.oncopyncmprocess", eventPayload);
+        for (const callback of copyNcmSubscribers) {
+          try {
+            callback(eventPayload);
+          } catch {
+            // ignore renderer callback failure
+          }
+        }
+      }
+      return copied;
+    },
     "browser.getcookies": async (payload = {}) => readCookies(payload),
     "browser.getfullcookies": async (payload = {}) => readCookies(payload),
     "browser.setcookie": async (payload = {}) => setCookie(payload),
@@ -2453,18 +3027,69 @@ function createNativeApi(options) {
     "network.diagnostic": async () => ({ ok: true }),
     "network.getenv": async () => ({ offline: false }),
     "network.getnetworkquality": async () => ({ score: 100, label: "unknown" }),
-    "download.start": async (payload = {}) => {
-      emitNativeEvent("download.onProcess", {
-        id: payload.id || "download-stub",
-        type: 0,
-        isLast: true,
-        relativePath: payload.relativePath || ""
-      });
-      return { ok: true, id: payload.id || "download-stub" };
+    "download.start": async (payload = {}) => startNativeDownload(payload),
+    "download.download": async (payload = {}) => startNativeDownload(payload),
+    "download.pause": async (payload = {}) => {
+      const task = getDownloadTaskByPayload(normalizeDownloadPayloadArgs(payload));
+      if (!task) {
+        return true;
+      }
+      task.status = "paused";
+      task.abortController.abort();
+      return true;
     },
-    "download.pause": async () => true,
-    "download.cancel": async () => true,
-    "download.querydownloadshecdule": async () => [],
+    "download.cancel": async (payload = {}) => {
+      const task = getDownloadTaskByPayload(normalizeDownloadPayloadArgs(payload));
+      if (!task) {
+        return true;
+      }
+      task.status = "cancelled";
+      task.abortController.abort();
+      return true;
+    },
+    "download.querydownloadshecdule": async (...args) => {
+      const inputItems = normalizeDownloadProcessQueryArgs(args);
+      return inputItems
+        .map((entry) => {
+          const task = activeDownloads.get(String(entry?.id || ""));
+          if (!task) {
+            return null;
+          }
+          const snapshot = getDownloadStateSnapshot(task);
+          return {
+            id: task.id,
+            path: entry?.path || task.relativePath,
+            progress: snapshot.progress,
+            download: snapshot.download,
+            total: snapshot.total,
+            speed: snapshot.speed
+          };
+        })
+        .filter(Boolean);
+    },
+    "download.downloadsync": async (payload = {}) => downloadFileOnce(payload),
+    "download.querydownloadingprocess": async (...args) => {
+      const inputItems = normalizeDownloadProcessQueryArgs(args);
+      return inputItems.map((entry) => {
+        const task = activeDownloads.get(String(entry?.id || ""));
+        if (!task) {
+          return {
+            id: String(entry?.id || ""),
+            path: String(entry?.path || ""),
+            progress: 0
+          };
+        }
+        const snapshot = getDownloadStateSnapshot(task);
+        return {
+          id: task.id,
+          path: entry?.path || task.relativePath,
+          progress: snapshot.progress,
+          download: snapshot.download,
+          total: snapshot.total,
+          speed: snapshot.speed
+        };
+      });
+    },
     "player.setsmtcenable": async () => true,
     "player.settextalign": async () => true,
     "player.setlinemode": async () => true,
