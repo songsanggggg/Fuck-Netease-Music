@@ -1,6 +1,7 @@
 "use strict";
 
 const { contextBridge, ipcRenderer } = require("electron");
+const { pathToFileURL } = require("node:url");
 
 const registeredCallbacks = new Map();
 const bootstrapLocalStorageDefaults = {
@@ -432,8 +433,16 @@ function createLocalAudioBridge() {
     return audioElement;
   };
 
-  const toOrpheusFileUrl = (filePath) =>
-    filePath ? `orpheus://file/${encodeURIComponent(String(filePath))}` : "";
+  const toPreparedFileUrl = (filePath) => {
+    if (!filePath) {
+      return "";
+    }
+    try {
+      return pathToFileURL(String(filePath)).toString();
+    } catch {
+      return "";
+    }
+  };
 
   const resolvePreparedPlayableSource = async (payload = {}) => {
     const directUrl = normalizePlayableUrl(readPlayableUrl(payload));
@@ -451,7 +460,7 @@ function createLocalAudioBridge() {
 
     const prepareTask = invokeNative("linuxport.prepareaudio", [{ url: directUrl }])
       .then((filePath) => {
-        const localUrl = toOrpheusFileUrl(filePath);
+        const localUrl = toPreparedFileUrl(filePath);
         return localUrl || directUrl;
       })
       .catch((error) => {
