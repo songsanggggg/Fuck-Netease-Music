@@ -292,7 +292,11 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           umask 077
-          printf '%b' "${{ secrets.AUR_SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/aur
+          if [ -n "${{ secrets.AUR_SSH_PRIVATE_KEY_B64 }}" ]; then
+            printf '%s' "${{ secrets.AUR_SSH_PRIVATE_KEY_B64 }}" | base64 -d > ~/.ssh/aur
+          else
+            printf '%b' "${{ secrets.AUR_SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/aur
+          fi
           chmod 600 ~/.ssh/aur
           ssh-keygen -y -f ~/.ssh/aur > /dev/null
           cat <<'EOF' > ~/.ssh/config
