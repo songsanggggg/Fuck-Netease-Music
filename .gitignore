@@ -2,4 +2,8 @@ node_modules/
 linux-port/node_modules/
 linux-port/out.log
 linux-port/debug/
+linux-port/dist/
+linux-port/build/
+linux-port/.cache/
+linux-port/.electron-builder/
 .DS_Store

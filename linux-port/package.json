@@ -7,6 +7,42 @@
   "scripts": {
     "start": "electron --no-sandbox ./src/main.js",
     "check": "node --check ./src/main.js && node --check ./src/preload.js && node --check ./src/native-api.js && node --check ./src/protocol.js",
-    "debug:boot": "bash ./scripts/debug-boot.sh"
+    "debug:boot": "bash ./scripts/debug-boot.sh",
+    "build:appimage": "electron-builder --linux AppImage"
+  },
+  "devDependencies": {
+    "electron": "^35.1.5",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.fucknetease.musiclinux",
+    "productName": "Fuck Netease Music",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "scripts/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../extracted/orpheus_pkg",
+        "to": "extracted/orpheus_pkg"
+      },
+      {
+        "from": "../extracted/resource",
+        "to": "extracted/resource"
+      }
+    ],
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "AudioVideo",
+      "executableName": "fuck-netease-music"
+    },
+    "artifactName": "${productName}-${version}-${arch}.${ext}"
   }
 }
