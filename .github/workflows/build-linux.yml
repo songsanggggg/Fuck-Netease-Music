@@ -134,6 +134,7 @@ jobs:
             packaging/arch/*.pkg.tar.zst
             packaging/arch/PKGBUILD
             packaging/arch/.SRCINFO
+          include-hidden-files: true
           if-no-files-found: error
 
   release:
