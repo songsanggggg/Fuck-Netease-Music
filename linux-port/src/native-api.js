@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-const { screen, shell, nativeTheme, dialog, session, globalShortcut } = require("electron");
+const { screen, shell, nativeTheme, dialog, session, globalShortcut, Menu, clipboard } = require("electron");
 
 function hashString(input) {
   return crypto.createHash("sha1").update(input).digest("hex");
@@ -356,6 +356,50 @@ function chromeCookieExpiresUtcToUnixSeconds(expiresUtc) {
 function callbackArgs(...args) {
   return {
     __nativeCallbackArgs: args
+  };
+}
+
+function normalizeMenuInput(menuArg = {}) {
+  if (Array.isArray(menuArg)) {
+    const [firstArg, secondArg] = menuArg;
+    if (firstArg && typeof firstArg === "object" && !Array.isArray(firstArg)) {
+      return normalizeMenuInput({
+        ...firstArg,
+        popupTarget: secondArg
+      });
+    }
+    return {
+      items: menuArg
+    };
+  }
+  if (!menuArg || typeof menuArg !== "object") {
+    return {
+      items: []
+    };
+  }
+  const contentItems =
+    typeof menuArg.content === "string" ? safeJsonParse(menuArg.content, []) : undefined;
+  const hotkeys =
+    typeof menuArg.hotkey === "string" ? safeJsonParse(menuArg.hotkey, {}) : undefined;
+  return {
+    ...menuArg,
+    hotkey: hotkeys ?? menuArg.hotkey,
+    items:
+      menuArg.items ||
+      menuArg.menuItems ||
+      menuArg.menus ||
+      menuArg.menu ||
+      menuArg.list ||
+      (Array.isArray(contentItems) ? contentItems : [])
+  };
+}
+
+function normalizeMenuCoordinates(payload = {}) {
+  const x = Number(payload.x ?? payload.left ?? payload.clientX ?? payload.pageX);
+  const y = Number(payload.y ?? payload.top ?? payload.clientY ?? payload.pageY);
+  return {
+    x: Number.isFinite(x) ? Math.round(x) : undefined,
+    y: Number.isFinite(y) ? Math.round(y) : undefined
   };
 }
 
@@ -870,6 +914,14 @@ function createNativeApi(options) {
   let persistentModelTableColumnsCache = null;
   const activeDownloads = new Map();
   const copyNcmSubscribers = new Set();
+  const playerRuntimeState = {
+    info: null,
+    lyrics: null,
+    totalTime: 0,
+    offset: 0,
+    likeMark: 0,
+    miniPlayerState: null
+  };
 
   if (fs.existsSync(localConfigPath)) {
     localConfig = safeJsonParse(fs.readFileSync(localConfigPath, "utf8"), {});
@@ -1521,6 +1573,184 @@ function createNativeApi(options) {
 
   function currentWindow() {
     return invocationWindow || mainWindowRef();
+  }
+
+  function buildPopupMenuTemplate(menuItems = [], selectionRef, pathPrefix = "root") {
+    if (!Array.isArray(menuItems)) {
+      return [];
+    }
+
+    return menuItems
+      .map((item, index) => {
+        if (!item || typeof item !== "object") {
+          return null;
+        }
+
+        const itemType = String(
+          item.type || item.itemType || item.menuType || item.kind || ""
+        ).toLowerCase();
+        if (itemType === "separator" || itemType === "splitline" || item.separator === true) {
+          return { type: "separator" };
+        }
+
+        const submenuItems =
+          item.submenu ||
+          item.subMenu ||
+          item.children ||
+          item.list ||
+          item.items ||
+          [];
+
+        const label = String(
+          item.label ||
+          item.title ||
+          item.name ||
+          item.text ||
+          item.menuName ||
+          ""
+        ).trim();
+        const menuId =
+          item.id ??
+          item.menuId ??
+          item.menu_id ??
+          item.eventKey ??
+          item.key ??
+          item.value ??
+          item.action ??
+          item.cmd ??
+          `${pathPrefix}.${index}`;
+        const role = typeof item.role === "string" ? item.role : undefined;
+        const enabled =
+          typeof item.enabled === "boolean"
+            ? item.enabled
+            : typeof item.enable === "boolean"
+              ? item.enable
+            : typeof item.disable === "boolean"
+              ? !item.disable
+              : typeof item.disabled === "boolean"
+                ? !item.disabled
+                : true;
+        const visible =
+          typeof item.visible === "boolean"
+            ? item.visible
+            : typeof item.hidden === "boolean"
+              ? !item.hidden
+              : true;
+        const checked = Boolean(item.checked ?? item.isChecked ?? false);
+        const rawClickValue =
+          item.clickValue ??
+          item.callbackValue ??
+          item.returnValue ??
+          item.menu_id ??
+          item.eventKey ??
+          item.id ??
+          item.key ??
+          item.value ??
+          item.action ??
+          item.cmd ??
+          label;
+        const submenu = buildPopupMenuTemplate(
+          Array.isArray(submenuItems) ? submenuItems : [],
+          selectionRef,
+          `${pathPrefix}.${index}`
+        );
+
+        if (!label && !submenu.length && !role) {
+          return null;
+        }
+
+        return {
+          id: String(menuId),
+          role,
+          label: label || undefined,
+          type:
+            checked || itemType === "checkbox"
+              ? "checkbox"
+              : itemType === "radio"
+                ? "radio"
+                : "normal",
+          enabled,
+          visible,
+          checked,
+          accelerator: item.accelerator || item.shortcut || item.hotkey || undefined,
+          submenu: submenu.length ? submenu : undefined,
+          click: () => {
+            selectionRef.value = rawClickValue;
+            selectionRef.item = normalizeDataValue(item);
+            selectionRef.hotkey =
+              item.hotkey ??
+              item.shortcut ??
+              item.accelerator ??
+              null;
+          }
+        };
+      })
+      .filter(Boolean);
+  }
+
+  async function showPopupMenu(rawPayload = {}) {
+    const win = currentWindow();
+    if (!win || win.isDestroyed() || typeof Menu?.buildFromTemplate !== "function") {
+      logger.log("[native:popupmenu:skip]", JSON.stringify({ reason: "window-unavailable" }));
+      return callbackArgs(null);
+    }
+
+    const payload = normalizeMenuInput(rawPayload);
+    const menuItems =
+      payload.menuItems ||
+      payload.items ||
+      payload.menus ||
+      payload.menu ||
+      payload.list ||
+      [];
+    const selectionRef = {
+      value: null,
+      item: null,
+      hotkey: null
+    };
+    const template = buildPopupMenuTemplate(menuItems, selectionRef);
+    if (!template.length) {
+      logger.log("[native:popupmenu:skip]", JSON.stringify({ reason: "empty-template", payload }));
+      return callbackArgs(null);
+    }
+
+    logger.log(
+      "[native:popupmenu:show]",
+      JSON.stringify({
+        itemCount: template.length,
+        payloadKeys: Object.keys(payload),
+        coords: normalizeMenuCoordinates(payload)
+      })
+    );
+    const menu = Menu.buildFromTemplate(template);
+    const { x, y } = normalizeMenuCoordinates(payload);
+
+    await new Promise((resolve) => {
+      menu.popup({
+        window: win,
+        x,
+        y,
+        callback: () => resolve()
+      });
+    });
+
+    logger.log(
+      "[native:popupmenu:result]",
+      JSON.stringify({
+        value: selectionRef.value,
+        item: selectionRef.item
+      })
+    );
+    if (selectionRef.value != null) {
+      setTimeout(() => {
+        emitNativeEvent(
+          "winhelper.onMenuClick",
+          String(selectionRef.value ?? ""),
+          selectionRef.hotkey == null ? "" : String(selectionRef.hotkey)
+        );
+      }, 0);
+    }
+    return callbackArgs(selectionRef.value, selectionRef.item);
   }
 
   function storageTargetFromPathMode(pathMode, targetPath) {
@@ -2824,6 +3054,40 @@ function createNativeApi(options) {
       }
       return copied;
     },
+    "storage.copyfiles": async (payload = {}) => {
+      const srcFiles = Array.isArray(payload?.srcFiles || payload?.sources)
+        ? payload.srcFiles || payload.sources
+        : [];
+      const destFiles = Array.isArray(payload?.destFiles || payload?.targets)
+        ? payload.destFiles || payload.targets
+        : [];
+      const copied = [];
+      for (let index = 0; index < Math.min(srcFiles.length, destFiles.length); index += 1) {
+        const src = String(srcFiles[index] || "");
+        const dst = String(destFiles[index] || "");
+        if (!src || !dst) {
+          continue;
+        }
+        await ensureDir(path.dirname(dst));
+        await fsp.copyFile(src, dst);
+        copied.push({
+          src,
+          dst
+        });
+      }
+      return copied;
+    },
+    "storage.offlinetrack": async (payload = {}) => {
+      try {
+        return await startNativeDownload(payload);
+      } catch (error) {
+        logger.warn("[native:storage.offlinetrack]", error?.message || error);
+        return {
+          ok: false,
+          error: error?.message || String(error)
+        };
+      }
+    },
     "browser.getcookies": async (payload = {}) => readCookies(payload),
     "browser.getfullcookies": async (payload = {}) => readCookies(payload),
     "browser.setcookie": async (payload = {}) => setCookie(payload),
@@ -2951,6 +3215,10 @@ function createNativeApi(options) {
       return true;
     },
     "winhelper.setwindowiconfromlocalfile": async () => true,
+    "winhelper.popupmenu": async (...args) => {
+      const payload = args.length === 1 ? args[0] : args;
+      return showPopupMenu(payload);
+    },
     "winhelper.updatemenu": async () => true,
     "winhelper.setusemediakey": async () => true,
     "winhelper.registerhotkey": async (nameOrPayload = {}, keyCodes, isGlobal, meta = {}) => {
@@ -3091,6 +3359,30 @@ function createNativeApi(options) {
       });
     },
     "player.setsmtcenable": async () => true,
+    "player.setminiplayerstate": async (payload = {}) => {
+      playerRuntimeState.miniPlayerState = normalizeDataValue(payload);
+      return true;
+    },
+    "player.setinfo": async (...args) => {
+      playerRuntimeState.info = normalizeDataValue(args);
+      return true;
+    },
+    "player.settotaltime": async (value = 0) => {
+      playerRuntimeState.totalTime = Number(value || 0);
+      return true;
+    },
+    "player.setlyrics": async (...args) => {
+      playerRuntimeState.lyrics = normalizeDataValue(args);
+      return true;
+    },
+    "player.setoffset": async (value = 0) => {
+      playerRuntimeState.offset = Number(value || 0);
+      return true;
+    },
+    "player.setlikemark": async (value = 0) => {
+      playerRuntimeState.likeMark = Number(value || 0);
+      return true;
+    },
     "player.settextalign": async () => true,
     "player.setlinemode": async () => true,
     "player.setdesktoplyrictopmost": async () => true,
@@ -3139,6 +3431,11 @@ function createNativeApi(options) {
       freeMemory: os.freemem()
     }),
     "os.navigateexternal": async (target) => shell.openExternal(String(target || "")),
+    "os.setclipboardtext": async (text = "") => {
+      clipboard.writeText(String(text || ""));
+      return true;
+    },
+    "os.getclipboardtext": async () => clipboard.readText(),
     "os.querysystemfonts": async () => [],
     "os.checknativesupportfonts": async () => [],
     "os.exitwindowsystemlefttime": async () => 0,

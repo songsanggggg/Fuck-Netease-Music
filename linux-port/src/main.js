@@ -1175,7 +1175,7 @@ app.whenReady().then(async () => {
     try {
       if (
         process.env.NETEASE_DEBUG_BOOT ||
-        /^download\.|^storage\.(querydownloadingprocess|startscandownload|checkfilesexist|addid3)/i.test(
+        /^download\.|^storage\.(querydownloadingprocess|startscandownload|checkfilesexist|addid3)|^winhelper\.popupmenu|^player\.(setlikemark|setinf|setinfo|setminiplayerstate|settotaltime|setlyrics|setoffset)/i.test(
           String(payload.command || "")
         )
       ) {
@@ -1186,7 +1186,7 @@ app.whenReady().then(async () => {
       });
       if (
         process.env.NETEASE_DEBUG_BOOT ||
-        /^download\.|^storage\.(querydownloadingprocess|startscandownload|checkfilesexist|addid3)/i.test(
+        /^download\.|^storage\.(querydownloadingprocess|startscandownload|checkfilesexist|addid3)|^winhelper\.popupmenu|^player\.(setlikemark|setinf|setinfo|setminiplayerstate|settotaltime|setlyrics|setoffset)/i.test(
           String(payload.command || "")
         )
       ) {
