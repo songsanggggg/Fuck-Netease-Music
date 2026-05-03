@@ -758,6 +758,432 @@ function normalizePlayableUrl(url) {
   return url.replace(/^http:\/\//i, "https://");
 }
 
+function createLocalPopupMenuBridge() {
+  const MENU_ROOT_ID = "__netease_linux_popup_menu_root__";
+  const MENU_STYLE_ID = "__netease_linux_popup_menu_style__";
+  const pointerState = {
+    clientX: 0,
+    clientY: 0,
+    hasValue: false
+  };
+  let activeMenu = null;
+
+  const updatePointerState = (event) => {
+    if (!event || !Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) {
+      return;
+    }
+    pointerState.clientX = event.clientX;
+    pointerState.clientY = event.clientY;
+    pointerState.hasValue = true;
+  };
+
+  window.addEventListener("pointerdown", updatePointerState, true);
+  window.addEventListener("pointermove", updatePointerState, true);
+
+  const ensureMenuStyle = () => {
+    if (document.getElementById(MENU_STYLE_ID)) {
+      return;
+    }
+
+    const style = document.createElement("style");
+    style.id = MENU_STYLE_ID;
+    style.textContent = `
+      #${MENU_ROOT_ID} {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        pointer-events: none;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-backdrop {
+        position: absolute;
+        inset: 0;
+        background: transparent;
+        pointer-events: auto;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-panel {
+        position: absolute;
+        min-width: 188px;
+        max-width: min(320px, calc(100vw - 24px));
+        padding: 8px;
+        border-radius: 16px;
+        border: 1px solid rgba(18, 18, 18, 0.08);
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 18px 50px rgba(15, 23, 42, 0.18), 0 4px 16px rgba(15, 23, 42, 0.08);
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
+        pointer-events: auto;
+        color: rgba(28, 28, 32, 0.94);
+        user-select: none;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        min-height: 38px;
+        padding: 0 10px;
+        border: 0;
+        border-radius: 12px;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-item:hover,
+      #${MENU_ROOT_ID} .linux-popup-menu-item:focus-visible {
+        background: rgba(235, 79, 62, 0.1);
+        outline: none;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-item[aria-disabled="true"] {
+        opacity: 0.42;
+        cursor: default;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 16px;
+        height: 16px;
+        flex: 0 0 16px;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-icon img {
+        width: 16px;
+        height: 16px;
+        object-fit: contain;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-label {
+        flex: 1;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        font-size: 13px;
+        line-height: 18px;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-caret {
+        font-size: 12px;
+        opacity: 0.45;
+      }
+      #${MENU_ROOT_ID} .linux-popup-menu-separator {
+        height: 1px;
+        margin: 6px 8px;
+        border: 0;
+        background: rgba(18, 18, 18, 0.08);
+      }
+      html[style*="color-scheme: dark"] #${MENU_ROOT_ID} .linux-popup-menu-panel,
+      body[style*="color-scheme: dark"] #${MENU_ROOT_ID} .linux-popup-menu-panel {
+        border-color: rgba(255, 255, 255, 0.1);
+        background: rgba(38, 38, 44, 0.94);
+        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.34), 0 4px 16px rgba(0, 0, 0, 0.2);
+        color: rgba(255, 255, 255, 0.92);
+      }
+      html[style*="color-scheme: dark"] #${MENU_ROOT_ID} .linux-popup-menu-item:hover,
+      html[style*="color-scheme: dark"] #${MENU_ROOT_ID} .linux-popup-menu-item:focus-visible,
+      body[style*="color-scheme: dark"] #${MENU_ROOT_ID} .linux-popup-menu-item:hover,
+      body[style*="color-scheme: dark"] #${MENU_ROOT_ID} .linux-popup-menu-item:focus-visible {
+        background: rgba(255, 255, 255, 0.08);
+      }
+      html[style*="color-scheme: dark"] #${MENU_ROOT_ID} .linux-popup-menu-separator,
+      body[style*="color-scheme: dark"] #${MENU_ROOT_ID} .linux-popup-menu-separator {
+        background: rgba(255, 255, 255, 0.1);
+      }
+    `;
+    document.head.appendChild(style);
+  };
+
+  const ensureRoot = () => {
+    let root = document.getElementById(MENU_ROOT_ID);
+    if (root) {
+      return root;
+    }
+    root = document.createElement("div");
+    root.id = MENU_ROOT_ID;
+    const mount = () => {
+      if (document.body && !root.isConnected) {
+        document.body.appendChild(root);
+      }
+    };
+    if (document.readyState === "loading") {
+      window.addEventListener("DOMContentLoaded", mount, { once: true });
+    } else {
+      mount();
+    }
+    return root;
+  };
+
+  const resolveMenuItems = (payload) => {
+    const rawItems =
+      payload?.menuItems ||
+      payload?.items ||
+      payload?.menus ||
+      payload?.menu ||
+      payload?.list ||
+      [];
+    return Array.isArray(rawItems) ? rawItems : [];
+  };
+
+  const normalizeMenuPayload = (args = []) => {
+    const primary = Array.isArray(args) ? args[0] : args;
+    const payload = primary && typeof primary === "object" ? { ...primary } : {};
+    if (typeof payload.content === "string" && !payload.items) {
+      const parsedContent = safeParseJson(payload.content, []);
+      if (Array.isArray(parsedContent)) {
+        payload.items = parsedContent;
+      }
+    }
+    if (typeof payload.hotkey === "string") {
+      payload.hotkeyMap = safeParseJson(payload.hotkey, {});
+    }
+    return payload;
+  };
+
+  const getFallbackAnchorRect = () => {
+    const activeElement =
+      document.activeElement && document.activeElement !== document.body
+        ? document.activeElement
+        : null;
+    if (activeElement && typeof activeElement.getBoundingClientRect === "function") {
+      const rect = activeElement.getBoundingClientRect();
+      if (rect.width > 0 || rect.height > 0) {
+        return rect;
+      }
+    }
+    return {
+      left: Math.max(12, window.innerWidth - 236),
+      right: Math.max(12, window.innerWidth - 44),
+      top: Math.max(12, window.innerHeight - 180),
+      bottom: Math.max(12, window.innerHeight - 88),
+      width: 192,
+      height: 44
+    };
+  };
+
+  const resolveAnchorPoint = () => {
+    if (pointerState.hasValue) {
+      return {
+        x: pointerState.clientX,
+        y: pointerState.clientY
+      };
+    }
+    const rect = getFallbackAnchorRect();
+    return {
+      x: Math.min(window.innerWidth - 20, rect.right),
+      y: Math.min(window.innerHeight - 20, rect.bottom)
+    };
+  };
+
+  const clampMenuPosition = (panel, x, y) => {
+    const margin = 12;
+    const width = panel.offsetWidth || 188;
+    const height = panel.offsetHeight || 40;
+    const left = Math.min(Math.max(margin, x), Math.max(margin, window.innerWidth - width - margin));
+    const top = Math.min(Math.max(margin, y), Math.max(margin, window.innerHeight - height - margin));
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+  };
+
+  const dispatchSelection = (menuId, hotkey) => {
+    const normalizedMenuId = menuId == null ? "" : String(menuId);
+    const normalizedHotkey = hotkey == null ? "" : String(hotkey);
+    window.setTimeout(() => {
+      runRegisteredCallbacks("winhelper.onMenuClick", [normalizedMenuId, normalizedHotkey]);
+    }, 0);
+  };
+
+  const closeActiveMenu = (result = null) => {
+    if (!activeMenu) {
+      return;
+    }
+    const { root, cleanup, resolve } = activeMenu;
+    activeMenu = null;
+    try {
+      cleanup();
+    } finally {
+      root.replaceChildren();
+      resolve(result);
+    }
+  };
+
+  const buildMenuItemElement = (item, payload, closeMenu) => {
+    if (!item || typeof item !== "object") {
+      return null;
+    }
+    if (item.separator) {
+      const separator = document.createElement("div");
+      separator.className = "linux-popup-menu-separator";
+      return separator;
+    }
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "linux-popup-menu-item";
+    const enabled =
+      typeof item.enable === "boolean"
+        ? item.enable
+        : typeof item.enabled === "boolean"
+          ? item.enabled
+          : typeof item.disable === "boolean"
+            ? !item.disable
+            : typeof item.disabled === "boolean"
+              ? !item.disabled
+              : true;
+    button.setAttribute("aria-disabled", enabled ? "false" : "true");
+
+    const icon = document.createElement("span");
+    icon.className = "linux-popup-menu-icon";
+    if (typeof item.image_path === "string" && item.image_path) {
+      const image = document.createElement("img");
+      image.src = item.image_path;
+      image.alt = "";
+      icon.appendChild(image);
+    }
+    button.appendChild(icon);
+
+    const label = document.createElement("span");
+    label.className = "linux-popup-menu-label";
+    label.textContent = typeof item.text === "string" ? item.text : "";
+    button.appendChild(label);
+
+    const children = Array.isArray(item.children) ? item.children.filter(Boolean) : [];
+    if (children.length) {
+      const caret = document.createElement("span");
+      caret.className = "linux-popup-menu-caret";
+      caret.textContent = "›";
+      button.appendChild(caret);
+    }
+
+    if (!enabled) {
+      button.tabIndex = -1;
+      return button;
+    }
+
+    const selectedHotkey =
+      item.hotkey ??
+      item.shortcut ??
+      item.accelerator ??
+      payload?.hotkeyMap?.[String(item.menu_id ?? "")] ??
+      "";
+
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (children.length) {
+        return;
+      }
+      closeMenu({
+        __nativeCallbackArgs: [item.menu_id ?? null, normalizeBridgeValue(item)]
+      });
+      dispatchSelection(item.menu_id, selectedHotkey);
+    });
+
+    return button;
+  };
+
+  const renderPopupMenu = (payload) =>
+    new Promise((resolve) => {
+      if (activeMenu) {
+        closeActiveMenu(null);
+      }
+      ensureMenuStyle();
+      const root = ensureRoot();
+      root.replaceChildren();
+
+      const backdrop = document.createElement("div");
+      backdrop.className = "linux-popup-menu-backdrop";
+      root.appendChild(backdrop);
+
+      const panel = document.createElement("div");
+      panel.className = "linux-popup-menu-panel";
+      panel.setAttribute("role", "menu");
+      root.appendChild(panel);
+
+      const list = document.createElement("div");
+      list.className = "linux-popup-menu-list";
+      panel.appendChild(list);
+
+      const items = resolveMenuItems(payload);
+      for (const item of items) {
+        const element = buildMenuItemElement(item, payload, closeActiveMenu);
+        if (element) {
+          list.appendChild(element);
+        }
+      }
+
+      const focusFirstItem = () => {
+        const firstButton = panel.querySelector(".linux-popup-menu-item[aria-disabled='false']");
+        if (firstButton && typeof firstButton.focus === "function") {
+          firstButton.focus();
+        }
+      };
+
+      const handlePointerDown = (event) => {
+        if (!panel.contains(event.target)) {
+          closeActiveMenu(null);
+        }
+      };
+
+      const handleKeyDown = (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeActiveMenu(null);
+        }
+      };
+
+      const cleanup = () => {
+        document.removeEventListener("pointerdown", handlePointerDown, true);
+        document.removeEventListener("keydown", handleKeyDown, true);
+      };
+
+      activeMenu = {
+        root,
+        cleanup,
+        resolve
+      };
+
+      document.addEventListener("pointerdown", handlePointerDown, true);
+      document.addEventListener("keydown", handleKeyDown, true);
+
+      requestAnimationFrame(() => {
+        const anchor = resolveAnchorPoint();
+        clampMenuPosition(panel, anchor.x - 16, anchor.y + 12);
+        focusFirstItem();
+      });
+
+      backdrop.addEventListener("click", () => {
+        closeActiveMenu(null);
+      });
+    });
+
+  const localHandlers = {
+    "winhelper.popupmenu": async (...args) => {
+      const payload = normalizeMenuPayload(args);
+      const items = resolveMenuItems(payload);
+      if (!items.length) {
+        return null;
+      }
+      return renderPopupMenu(payload);
+    }
+  };
+
+  return {
+    has(command) {
+      return Boolean(localHandlers[String(command || "").toLowerCase()]);
+    },
+    async invoke(command, args = []) {
+      const handler = localHandlers[String(command || "").toLowerCase()];
+      if (!handler) {
+        return undefined;
+      }
+      return handler(...(Array.isArray(args) ? args : [args]));
+    }
+  };
+}
+
 function createLocalAudioBridge() {
   let audioElement = null;
   let currentPlayId = "";
@@ -1860,9 +2286,27 @@ function installReactDomProbe() {
 }
 
 const localAudioBridge = createLocalAudioBridge();
+const localPopupMenuBridge = createLocalPopupMenuBridge();
 
 const bridge = {
   call(name, ...args) {
+    if (localAudioBridge.has(name)) {
+      return Promise.resolve(localAudioBridge.invoke(name, args)).then((result) =>
+        normalizeBridgeValue(result)
+      );
+    }
+    if (localPopupMenuBridge.has(name)) {
+      return Promise.resolve(localPopupMenuBridge.invoke(name, args)).then((result) => {
+        if (
+          result &&
+          typeof result === "object" &&
+          Array.isArray(result.__nativeCallbackArgs)
+        ) {
+          return normalizeBridgeValue(result.__nativeCallbackArgs[0]);
+        }
+        return normalizeBridgeValue(result);
+      });
+    }
     return invokeNative(name, args).then((result) => {
       if (
         result &&
@@ -1978,6 +2422,29 @@ const channel = {
         })
         .catch((error) => {
           console.error("[channel.call:local]", name, error);
+          if (typeof callback === "function") {
+            callback(null);
+          }
+        });
+      return;
+    }
+    if (localPopupMenuBridge.has(name)) {
+      Promise.resolve(localPopupMenuBridge.invoke(name, args))
+        .then((result) => {
+          if (typeof callback === "function") {
+            if (
+              result &&
+              typeof result === "object" &&
+              Array.isArray(result.__nativeCallbackArgs)
+            ) {
+              callback(...normalizeBridgeValue(result.__nativeCallbackArgs));
+              return;
+            }
+            callback(normalizeBridgeValue(result));
+          }
+        })
+        .catch((error) => {
+          console.error("[channel.call:local-menu]", name, error);
           if (typeof callback === "function") {
             callback(null);
           }
