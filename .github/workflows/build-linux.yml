@@ -86,6 +86,51 @@ jobs:
           path: linux-port/dist/*.AppImage
           if-no-files-found: error
 
+  build-deb:
+    name: Debian Package (${{ matrix.arch }})
+    needs: check
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runs_on: ubuntu-latest
+          - arch: arm64
+            runs_on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: linux-port/package-lock.json
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot rpm
+
+      - name: Install dependencies
+        working-directory: ${{ env.APP_DIR }}
+        run: npm ci
+
+      - name: Build Debian package
+        working-directory: ${{ env.APP_DIR }}
+        run: npx electron-builder --linux deb --publish never --${{ matrix.arch }}
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-package-${{ matrix.arch }}
+          path: linux-port/dist/*.deb
+          if-no-files-found: error
+
   build-arch-package:
     name: Arch Linux Package
     needs: build-appimage
@@ -140,6 +185,7 @@ jobs:
     name: Publish Release
     needs:
       - build-appimage
+      - build-deb
       - build-arch-package
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -160,6 +206,18 @@ jobs:
         with:
           name: appimage-arm64
           path: release-assets/appimage-arm64
+
+      - name: Download x64 Debian package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deb-package-x64
+          path: release-assets/deb-x64
+
+      - name: Download arm64 Debian package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deb-package-arm64
+          path: release-assets/deb-arm64
 
       - name: Download Arch package artifact
         uses: actions/download-artifact@v4
@@ -227,6 +285,8 @@ jobs:
           files: |
             release-assets/upload/fuck-netease-music-x64.AppImage
             release-assets/upload/fuck-netease-music-arm64.AppImage
+            release-assets/deb-x64/*.deb
+            release-assets/deb-arm64/*.deb
             release-assets/archlinux/*.pkg.tar.zst
             release-assets/archlinux/PKGBUILD
             release-assets/archlinux/.SRCINFO
