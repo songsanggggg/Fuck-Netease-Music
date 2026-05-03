@@ -90,15 +90,13 @@ jobs:
   build-deb:
     name: Debian Package (${{ matrix.arch }})
     needs: check
-    runs-on: ${{ matrix.runs_on }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x64
-            runs_on: ubuntu-latest
-          - arch: arm64
-            runs_on: ubuntu-24.04-arm
+        arch:
+          - x64
+          - arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
