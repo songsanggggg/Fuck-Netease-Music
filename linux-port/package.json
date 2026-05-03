@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "description": "Electron-based Linux host PoC for the extracted NetEase Cloud Music desktop frontend.",
+  "homepage": "https://github.com/fucknetease/Fuck-Netease-Music",
+  "author": {
+    "name": "fucknetease",
+    "email": "sh1tnetease@outlook.com"
+  },
   "main": "src/main.js",
   "scripts": {
     "start": "electron --no-sandbox ./src/main.js",
@@ -41,7 +46,8 @@
         "AppImage"
       ],
       "category": "AudioVideo",
-      "executableName": "fuck-netease-music"
+      "executableName": "fuck-netease-music",
+      "maintainer": "fucknetease <sh1tnetease@outlook.com>"
     },
     "artifactName": "${productName}-${version}-${arch}.${ext}"
   }

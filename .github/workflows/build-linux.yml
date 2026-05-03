@@ -15,6 +15,7 @@ permissions:
 
 env:
   APP_DIR: linux-port
+  AUR_PKGBASE: fuck-netease-music-git
 
 jobs:
   check:
@@ -290,3 +291,94 @@ jobs:
             release-assets/archlinux/*.pkg.tar.zst
             release-assets/archlinux/PKGBUILD
             release-assets/archlinux/.SRCINFO
+
+  publish-aur:
+    name: Publish to AUR
+    needs:
+      - release
+    if: github.event_name == 'push' && github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download x64 AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: appimage-x64
+          path: aur-input
+
+      - name: Prepare AUR metadata
+        id: aurmeta
+        run: |
+          PACKAGE_VERSION="$(node -p "require('./linux-port/package.json').version")"
+          COMMIT_COUNT="$(git rev-list --count HEAD)"
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          PKGVER="${PACKAGE_VERSION}.r${COMMIT_COUNT}.g${SHORT_SHA}"
+          APPIMAGE_FILE="fuck-netease-music-x64.AppImage"
+          cp aur-input/*.AppImage "${APPIMAGE_FILE}"
+          APPIMAGE_SHA256="$(sha256sum "${APPIMAGE_FILE}" | awk '{print $1}')"
+          APPIMAGE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/rolling-main/${APPIMAGE_FILE}"
+
+          sed \
+            -e "s/__PKGVER__/${PKGVER}/g" \
+            -e "s|__APPIMAGE_URL__|${APPIMAGE_URL}|g" \
+            -e "s/__APPIMAGE_SHA256__/${APPIMAGE_SHA256}/g" \
+            packaging/aur/PKGBUILD.in > packaging/aur/PKGBUILD
+
+          {
+            echo "pkgver=${PKGVER}"
+            echo "appimage_sha256=${APPIMAGE_SHA256}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Generate .SRCINFO
+        run: |
+          mkdir -p packaging/aur/out
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -v "${PWD}:/workspace" \
+            -w /workspace \
+            archlinux:base-devel \
+            bash -lc '
+              cd /workspace/packaging/aur &&
+              makepkg --printsrcinfo > /workspace/packaging/aur/out/.SRCINFO
+            '
+          cp packaging/aur/out/.SRCINFO packaging/aur/.SRCINFO
+
+      - name: Setup AUR SSH
+        run: |
+          mkdir -p ~/.ssh
+          umask 077
+          printf '%s' "${{ secrets.FUCK_NETEASE_AUR }}" | tr -d '\r' > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keygen -y -f ~/.ssh/aur > /dev/null
+          cat <<'EOF' > ~/.ssh/config
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+          EOF
+
+      - name: Clone AUR repo
+        run: |
+          git clone "ssh://aur@aur.archlinux.org/${AUR_PKGBASE}.git" aur-repo
+
+      - name: Update AUR files
+        run: |
+          cp packaging/aur/PKGBUILD aur-repo/PKGBUILD
+          cp packaging/aur/.SRCINFO aur-repo/.SRCINFO
+          cp packaging/aur/fuck-netease-music.sh aur-repo/fuck-netease-music.sh
+          cp packaging/aur/fuck-netease-music.desktop aur-repo/fuck-netease-music.desktop
+
+      - name: Commit and push to AUR
+        run: |
+          cd aur-repo
+          git config user.name "fucknetease"
+          git config user.email "sh1tnetease@outlook.com"
+          git add PKGBUILD .SRCINFO fuck-netease-music.sh fuck-netease-music.desktop
+          git diff --cached --quiet && exit 0
+          git commit -m "update to ${{ steps.aurmeta.outputs.pkgver }}"
+          git push
