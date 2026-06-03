@@ -110,6 +110,10 @@ function createWindowManager(options) {
     childWindows.add(win);
     wireExternalNavigation(win);
 
+    win.webContents.on("did-create-window", (childWin) => {
+      wireAuxiliaryWindow(childWin);
+    });
+
     win.on("closed", () => {
       childWindows.delete(win);
       for (const [key, candidate] of childWindowsByKey.entries()) {
@@ -203,9 +207,10 @@ function createWindowManager(options) {
       if (nativeApi?.shouldHideOnClose?.()) {
         event.preventDefault();
         mainWindow.hide();
+      } else {
+        nativeApi?.emitNativeEvent("winhelper.onSystemRequestCloseWindow");
+        nativeApi?.emitNativeEvent("winhelper.onClose");
       }
-      nativeApi?.emitNativeEvent("winhelper.onSystemRequestCloseWindow");
-      nativeApi?.emitNativeEvent("winhelper.onClose");
     });
     mainWindow.on("closed", () => {
       mainWindow = null;
@@ -270,7 +275,7 @@ function createWindowManager(options) {
   }
 
   function closeChildWindows() {
-    for (const win of childWindows) {
+    for (const win of [...childWindows]) {
       if (win && !win.isDestroyed()) {
         win.close();
       }

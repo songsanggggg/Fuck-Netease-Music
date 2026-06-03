@@ -79,7 +79,12 @@ function resolveStorageFile(storageRoot, inputPath) {
 }
 
 function resolveAbsoluteOrRelativePath(nativeApi, inputPath) {
-  const decoded = decodeURIComponent(inputPath);
+  let decoded;
+  try {
+    decoded = decodeURIComponent(inputPath);
+  } catch {
+    return null;
+  }
   if (!decoded || decoded === "/") {
     return null;
   }
@@ -104,8 +109,9 @@ async function createFileResponse(electronNet, filePath) {
 }
 
 async function createMissingResponse(url) {
+  const escapedUrl = String(url).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   return new Response(
-    `<!doctype html><html><body><h1>404</h1><p>${url} was not found.</p></body></html>`,
+    `<!doctype html><html><body><h1>404</h1><p>${escapedUrl} was not found.</p></body></html>`,
     {
       status: 404,
       headers: {
@@ -135,12 +141,36 @@ async function handleOrpheusRequest(request, electronNet, nativeApi) {
       break;
     case "file":
       resolvedFile = resolveAbsoluteOrRelativePath(nativeApi, url.pathname);
+      if (resolvedFile) {
+        resolvedFile =
+          ensureInside(nativeApi.storageRoot, resolvedFile) ||
+          ensureInside(nativeApi.extractedRoot, resolvedFile) ||
+          ensureInside(nativeApi.assetRoot, resolvedFile) ||
+          ensureInside(nativeApi.cacheRoot, resolvedFile) ||
+          null;
+      }
       break;
     case "localmusic":
       resolvedFile = resolveAbsoluteOrRelativePath(nativeApi, url.searchParams.get("path") || url.pathname);
+      if (resolvedFile) {
+        resolvedFile =
+          ensureInside(nativeApi.storageRoot, resolvedFile) ||
+          ensureInside(nativeApi.extractedRoot, resolvedFile) ||
+          ensureInside(nativeApi.assetRoot, resolvedFile) ||
+          ensureInside(nativeApi.cacheRoot, resolvedFile) ||
+          null;
+      }
       break;
     case "orpheus":
       resolvedFile = resolveAbsoluteOrRelativePath(nativeApi, url.pathname);
+      if (resolvedFile) {
+        resolvedFile =
+          ensureInside(nativeApi.storageRoot, resolvedFile) ||
+          ensureInside(nativeApi.extractedRoot, resolvedFile) ||
+          ensureInside(nativeApi.assetRoot, resolvedFile) ||
+          ensureInside(nativeApi.cacheRoot, resolvedFile) ||
+          null;
+      }
       break;
     default:
       break;

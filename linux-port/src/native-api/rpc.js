@@ -94,7 +94,7 @@ function buildCompatibilityFallbackRequest(apiPath, payloadObject = {}) {
       if (typeof value === "undefined" || value === null) {
         continue;
       }
-      requestBody.set(key, typeof value === "string" ? value : String(value));
+    requestBody.set(key, typeof value === "string" ? value : JSON.stringify(value));
     }
     return {
       url: "https://music.163.com/api/v6/playlist/detail",

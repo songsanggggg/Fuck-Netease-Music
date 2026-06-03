@@ -28,6 +28,45 @@ function createWindowHandlers(options) {
     return "NetEase Cloud Music";
   }
 
+  const KEYCODE_TO_KEY = {
+    8: "Backspace", 9: "Tab", 13: "Enter", 27: "Escape", 32: "Space",
+    33: "PageUp", 34: "PageDown", 35: "End", 36: "Home",
+    37: "Left", 38: "Up", 39: "Right", 40: "Down",
+    46: "Delete", 45: "Insert",
+    112: "F1", 113: "F2", 114: "F3", 115: "F4", 116: "F5", 117: "F6",
+    118: "F7", 119: "F8", 120: "F9", 121: "F10", 122: "F11", 123: "F12",
+    186: "Semicolon", 187: "Equal", 188: "Comma", 189: "Minus", 190: "Period",
+    191: "Slash", 192: "Backquote",
+    219: "BracketLeft", 220: "Backslash", 221: "BracketRight", 222: "Quote"
+  };
+
+  function keyCodesToAccelerator(keyCodes = []) {
+    if (!Array.isArray(keyCodes) || keyCodes.length === 0) {
+      return "";
+    }
+    const parts = [];
+    const keyParts = [];
+    for (const code of keyCodes) {
+      const c = Number(code);
+      if (c === 16) { parts.push("Shift"); }
+      else if (c === 17) { parts.push("Ctrl"); }
+      else if (c === 18) { parts.push("Alt"); }
+      else if (c === 91 || c === 93) { parts.push("Super"); }
+      else {
+        const mapped = KEYCODE_TO_KEY[c];
+        if (mapped) {
+          keyParts.push(mapped);
+        } else if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90)) {
+          keyParts.push(String.fromCharCode(c));
+        }
+      }
+    }
+    if (keyParts.length === 0) {
+      return "";
+    }
+    return [...parts, keyParts[0]].join("+");
+  }
+
   function resolveMinimumSizeValue(...candidates) {
     for (const candidate of candidates) {
       const parsed = Number(candidate);
@@ -203,6 +242,16 @@ function createWindowHandlers(options) {
           isGlobal: Boolean(isGlobal)
         };
         saveSettings();
+        const accelerator = keyCodesToAccelerator(keyCodes);
+        if (accelerator) {
+          try {
+            globalShortcut.register(accelerator, () => {
+              emitNativeEvent("winhelper.onHotkey", nameOrPayload, Boolean(isGlobal));
+            });
+          } catch {
+            // accelerator registration failed
+          }
+        }
         emitNativeEvent(
           "winhelper.onRegisterHotkeyResult",
           nameOrPayload,

@@ -29,7 +29,6 @@
     "files": [
       "build/**/*",
       "src/**/*",
-      "scripts/**/*",
       "package.json"
     ],
     "extraResources": [
@@ -51,6 +50,6 @@
       "executableName": "fuck-netease-music",
       "maintainer": "fucknetease <sh1tnetease@outlook.com>"
     },
-    "artifactName": "${productName}-${version}-${arch}.${ext}"
+    "artifactName": "${name}-${version}-${arch}.${ext}"
   }
 }

@@ -527,9 +527,11 @@ function createDownloadManager(options) {
       if (!src || !dst) {
         continue;
       }
-      await ensureDir(path.dirname(dst));
-      await fsp.copyFile(src, dst);
-      const eventPayload = { type: "copyncm", code: 0, src, dst };
+      const resolvedSrc = normalizeStorageTarget(src) || src;
+      const resolvedDst = normalizeStorageTarget(dst) || dst;
+      await ensureDir(path.dirname(resolvedDst));
+      await fsp.copyFile(resolvedSrc, resolvedDst);
+      const eventPayload = { type: "copyncm", code: 0, src: resolvedSrc, dst: resolvedDst };
       copied.push(eventPayload);
       emitNativeEvent("storage.oncopyncmprocess", eventPayload);
       for (const callback of copyNcmSubscribers) {

@@ -1146,6 +1146,10 @@ function createNativeApi(options) {
       return null;
     }
 
+    if (rawPath.includes("..")) {
+      return null;
+    }
+
     if (path.isAbsolute(rawPath) && fs.existsSync(rawPath)) {
       return rawPath;
     }
@@ -1210,7 +1214,7 @@ function createNativeApi(options) {
     }
     const image = nativeImage.createFromPath(resolvedPath);
     if (!image || image.isEmpty()) {
-      return resolvedPath;
+      return null;
     }
     return image;
   }
@@ -1328,7 +1332,7 @@ function createNativeApi(options) {
     ) {
       return resolved;
     }
-    return resolved;
+    return null;
   }
 
   const downloadManager = createDownloadManager({
@@ -1534,7 +1538,11 @@ function createNativeApi(options) {
 
   function storageTargetFromPathMode(pathMode, targetPath) {
     if (pathMode === "abs") {
-      return String(targetPath || "");
+      const resolved = String(targetPath || "");
+      if (resolved && (isSubPath(storageRoot, resolved) || isSubPath(extractedRoot, resolved) || isSubPath(assetRoot, resolved))) {
+        return resolved;
+      }
+      return null;
     }
     return normalizeStorageTarget(targetPath);
   }
@@ -2439,9 +2447,6 @@ function createNativeApi(options) {
         const fileId = String(file?.id || "");
         const rawPath = String(file?.path || "");
         let candidatePath = resolveDownloadFilePath(resolvedBaseDir, rawPath);
-        if (!candidatePath && path.isAbsolute(rawPath)) {
-          candidatePath = rawPath;
-        }
         if (!candidatePath && rawPath) {
           candidatePath = resolveDownloadFilePath(resolvedBaseDir, rawPath.replace(/^\/+/, ""));
         }
@@ -2500,11 +2505,16 @@ function createNativeApi(options) {
         if (!src || !dst) {
           continue;
         }
-        await ensureDir(path.dirname(dst));
-        await fsp.copyFile(src, dst);
+        const resolvedSrc = resolveOrpheusPath(src) || (path.isAbsolute(src) ? src : null);
+        const resolvedDst = resolveOrpheusPath(dst) || (path.isAbsolute(dst) ? dst : null);
+        if (!resolvedSrc || !resolvedDst) {
+          continue;
+        }
+        await ensureDir(path.dirname(resolvedDst));
+        await fsp.copyFile(resolvedSrc, resolvedDst);
         copied.push({
-          src,
-          dst
+          src: resolvedSrc,
+          dst: resolvedDst
         });
       }
       return copied;

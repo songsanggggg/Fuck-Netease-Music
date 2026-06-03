@@ -350,7 +350,7 @@ function createBootstrapRuntime(options) {
               }
             : result;
       return new Response(normalizedResult?.text ?? "", {
-        status: normalizedResult?.status || 500,
+        status: normalizedResult?.status ?? 500,
         headers: normalizedResult?.headers || {}
       });
     };

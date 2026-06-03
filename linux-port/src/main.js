@@ -63,9 +63,15 @@ function detectAppVersion() {
     return versionFromEnv;
   }
 
-  const exeMatch = fs
-    .readdirSync(projectRoot)
-    .find((entry) => /^NeteaseCloudMusic_.*_(\d+\.\d+\.\d+\.\d+)_\d+\.exe$/i.test(entry));
+  const exeMatch = (() => {
+    try {
+      return fs
+        .readdirSync(projectRoot)
+        .find((entry) => /^NeteaseCloudMusic_.*_(\d+\.\d+\.\d+\.\d+)_\d+\.exe$/i.test(entry));
+    } catch {
+      return undefined;
+    }
+  })();
   if (exeMatch) {
     const match = exeMatch.match(/_(\d+\.\d+\.\d+\.\d+)_\d+\.exe$/i);
     if (match) {
@@ -544,11 +550,19 @@ app.whenReady().then(async () => {
   if (nativeApi && typeof nativeApi.ensureTrayIconInstalled === "function") {
     nativeApi.ensureTrayIconInstalled();
   }
+}).catch((error) => {
+  console.error("[app:startup-failed]", error);
 });
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
+  }
+});
+
+app.on("before-quit", () => {
+  if (nativeApi && typeof nativeApi.markAppQuitRequested === "function") {
+    nativeApi.markAppQuitRequested();
   }
 });
 
