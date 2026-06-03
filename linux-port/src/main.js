@@ -28,8 +28,10 @@ app.commandLine.appendSwitch("disable-features", "OutOfBlinkCors");
 app.commandLine.appendSwitch("disable-web-security");
 app.commandLine.appendSwitch("no-sandbox");
 
-const projectRoot = path.resolve(__dirname, "..", "..");
 const linuxPortRoot = path.resolve(__dirname, "..");
+const projectRoot = app.isPackaged
+  ? path.resolve(linuxPortRoot, "..")
+  : path.resolve(__dirname, "..", "..");
 const assetRoot = process.env.NETEASE_ASSET_ROOT
   ? path.resolve(process.env.NETEASE_ASSET_ROOT)
   : path.join(projectRoot, "extracted", "orpheus_pkg", "pub");
@@ -538,6 +540,10 @@ app.whenReady().then(async () => {
   });
 
   windowManager.createMainWindow();
+
+  if (nativeApi && typeof nativeApi.ensureTrayIconInstalled === "function") {
+    nativeApi.ensureTrayIconInstalled();
+  }
 });
 
 app.on("window-all-closed", () => {

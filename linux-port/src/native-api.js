@@ -2983,6 +2983,7 @@ function createNativeApi(options) {
       appQuitRequested = true;
     },
     shouldHideOnClose,
+    ensureTrayIconInstalled,
     resolveOrpheusPath,
     storageRoot
   };
