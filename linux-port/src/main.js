@@ -483,6 +483,7 @@ app.whenReady().then(async () => {
     appVersion,
     appIconPath,
     createWindow: windowManager.createAuxiliaryWindow,
+    closeChildWindows: windowManager.closeChildWindows,
     extractedRoot,
     logger: console
   });

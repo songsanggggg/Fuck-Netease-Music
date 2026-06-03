@@ -269,9 +269,18 @@ function createWindowManager(options) {
     return mainWindow;
   }
 
+  function closeChildWindows() {
+    for (const win of childWindows) {
+      if (win && !win.isDestroyed()) {
+        win.close();
+      }
+    }
+  }
+
   return {
     createAuxiliaryWindow,
     createMainWindow,
+    closeChildWindows,
     getMainWindow() {
       return mainWindow;
     },
