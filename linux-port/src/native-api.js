@@ -513,6 +513,7 @@ function createNativeApi(options) {
     assetRoot,
     extractedRoot,
     createWindow = null,
+    closeChildWindows = null,
     appVersion = "3.1.32.205206",
     appIconPath = ""
   } = options;
@@ -1036,6 +1037,9 @@ function createNativeApi(options) {
       const bootstrap = await buildSessionBootstrapState();
       if (bootstrap?.host?.uid) {
         emitNativeEvent("session.bootstrap.updated", bootstrap);
+        if (typeof closeChildWindows === "function") {
+          closeChildWindows();
+        }
       }
     } catch (error) {
       logger.warn("[native:session-bootstrap:emit]", error.message);
