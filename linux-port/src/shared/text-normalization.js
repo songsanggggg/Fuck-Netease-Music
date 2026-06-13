@@ -26,6 +26,52 @@ function scoreUtf8MojibakeMarkers(value) {
   );
 }
 
+function countReplacementChars(value) {
+  return countMatches(value, /\uFFFD/g);
+}
+
+function attemptUtf8MojibakeRepair(value) {
+  if (typeof value !== "string" || !value) {
+    return value;
+  }
+
+  try {
+    return Buffer.from(value, "latin1").toString("utf8");
+  } catch {
+    return value;
+  }
+}
+
+function shouldAcceptRepair(originalValue, repairedValue) {
+  if (!repairedValue || repairedValue === originalValue) {
+    return false;
+  }
+
+  const originalReadableScore = scoreReadableEastAsianText(originalValue);
+  const repairedReadableScore = scoreReadableEastAsianText(repairedValue);
+  const originalMarkerScore = scoreUtf8MojibakeMarkers(originalValue);
+  const repairedMarkerScore = scoreUtf8MojibakeMarkers(repairedValue);
+  const originalReplacementChars = countReplacementChars(originalValue);
+  const repairedReplacementChars = countReplacementChars(repairedValue);
+
+  if (repairedReadableScore <= originalReadableScore) {
+    return false;
+  }
+
+  if (repairedMarkerScore > originalMarkerScore) {
+    return false;
+  }
+
+  if (
+    repairedReplacementChars > Math.max(1, originalReplacementChars) &&
+    repairedReadableScore < originalReadableScore + 4
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
 function maybeRepairUtf8Mojibake(value) {
   if (typeof value !== "string" || !value) {
     return value;
@@ -36,34 +82,29 @@ function maybeRepairUtf8Mojibake(value) {
     return value;
   }
 
-  let repaired;
-  try {
-    repaired = Buffer.from(value, "latin1").toString("utf8");
-  } catch {
-    return value;
+  let bestValue = value;
+  let candidate = value;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    candidate = attemptUtf8MojibakeRepair(candidate);
+    if (!shouldAcceptRepair(bestValue, candidate)) {
+      break;
+    }
+    bestValue = candidate;
   }
 
-  if (!repaired || repaired === value || repaired.includes("\uFFFD")) {
-    return value;
+  if (bestValue === value && markerScore > 0) {
+    const repaired = attemptUtf8MojibakeRepair(value);
+    if (shouldAcceptRepair(value, repaired)) {
+      return repaired;
+    }
   }
 
-  const originalReadableScore = scoreReadableEastAsianText(value);
-  const repairedReadableScore = scoreReadableEastAsianText(repaired);
-  const repairedMarkerScore = scoreUtf8MojibakeMarkers(repaired);
-
-  if (repairedReadableScore <= originalReadableScore) {
-    return value;
-  }
-
-  if (repairedMarkerScore > markerScore) {
-    return value;
-  }
-
-  return repaired;
+  return bestValue;
 }
 
 module.exports = {
   countMatches,
+  countReplacementChars,
   scoreReadableEastAsianText,
   scoreUtf8MojibakeMarkers,
   maybeRepairUtf8Mojibake

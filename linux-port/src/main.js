@@ -35,7 +35,9 @@ const projectRoot = app.isPackaged
 const assetRoot = process.env.NETEASE_ASSET_ROOT
   ? path.resolve(process.env.NETEASE_ASSET_ROOT)
   : path.join(projectRoot, "extracted", "orpheus_pkg", "pub");
-const appIconPath = path.join(linuxPortRoot, "build", "icon.png");
+const appIconPath = app.isPackaged
+  ? path.join(process.resourcesPath, "build", "icon.png")
+  : path.join(linuxPortRoot, "build", "icon.png");
 const extractedRoot = path.join(projectRoot, "extracted");
 const debugRoot = path.join(linuxPortRoot, "debug");
 const sharedWebPreferences = {

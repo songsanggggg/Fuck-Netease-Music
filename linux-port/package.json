@@ -33,6 +33,10 @@
     ],
     "extraResources": [
       {
+        "from": "build/icon.png",
+        "to": "build/icon.png"
+      },
+      {
         "from": "../extracted/orpheus_pkg",
         "to": "extracted/orpheus_pkg"
       },

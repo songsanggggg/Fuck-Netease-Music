@@ -469,6 +469,9 @@ function createLocalAudioBridge(options) {
     if (!normalizedUrl) {
       return false;
     }
+    if (/^https:\/\/[^/]+\.music\.126\.net(\/|$)/i.test(normalizedUrl)) {
+      return true;
+    }
     if (/\.flac(?:$|\?)/i.test(normalizedUrl)) {
       return true;
     }
