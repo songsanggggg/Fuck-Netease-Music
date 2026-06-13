@@ -4,8 +4,10 @@ const crypto = require("node:crypto");
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const { Readable } = require("node:stream");
 const {
   screen,
   shell,
@@ -554,6 +556,12 @@ function createNativeApi(options) {
     instance: null,
     iconPath: "",
     tooltip: "网易云音乐"
+  };
+  const audioProxyState = {
+    server: null,
+    port: 0,
+    pendingStart: null,
+    routeByToken: new Map()
   };
   const playerUrlResponseCache = new Map();
   const playerRuntimeState = {
@@ -1531,6 +1539,176 @@ function createNativeApi(options) {
       text,
       time: Date.now()
     });
+  }
+
+  function shouldProxyAudioUrl(inputUrl = "") {
+    return /^https:\/\/[^/]+\.music\.126\.net(\/|$)/i.test(String(inputUrl || ""));
+  }
+
+  function normalizeProxyRouteToken(token = "") {
+    return String(token || "").replace(/[^a-zA-Z0-9_-]/g, "");
+  }
+
+  function rememberAudioProxyRoute(targetUrl = "") {
+    const token = hashString(`${targetUrl}:${Date.now()}:${Math.random()}`);
+    audioProxyState.routeByToken.set(token, {
+      targetUrl,
+      createdAt: Date.now()
+    });
+    if (audioProxyState.routeByToken.size > 256) {
+      const entries = [...audioProxyState.routeByToken.entries()].sort(
+        (left, right) => left[1].createdAt - right[1].createdAt
+      );
+      for (const [staleToken] of entries.slice(0, entries.length - 256)) {
+        audioProxyState.routeByToken.delete(staleToken);
+      }
+    }
+    return token;
+  }
+
+  async function proxyAudioRequest(request, response) {
+    const requestUrl = new URL(request.url || "/", "http://127.0.0.1");
+    const token = normalizeProxyRouteToken(requestUrl.pathname.replace(/^\/audio\//, ""));
+    const route = audioProxyState.routeByToken.get(token);
+    if (!route?.targetUrl) {
+      response.writeHead(404, {
+        "content-type": "text/plain; charset=utf-8",
+        "access-control-allow-origin": "*"
+      });
+      response.end("audio route not found");
+      return;
+    }
+
+    const targetUrl = route.targetUrl;
+    const headers = {
+      Origin: "https://music.163.com",
+      origin: "https://music.163.com",
+      Referer: "https://music.163.com/",
+      referer: "https://music.163.com/",
+      Accept: request.headers.accept || "audio/*,*/*;q=0.9"
+    };
+    if (request.headers.range) {
+      headers.Range = request.headers.range;
+    }
+    const cookies = await session.defaultSession.cookies.get({ url: targetUrl });
+    if (cookies.length > 0) {
+      headers.Cookie = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+    }
+
+    let upstreamResponse;
+    try {
+      upstreamResponse = await fetchWithRetry(
+        targetUrl,
+        {
+          method: request.method || "GET",
+          headers
+        },
+        {
+          apiPath: "/audio-proxy",
+          loggerRef: logger
+        }
+      );
+    } catch (error) {
+      logger.warn(
+        "[native:audio-proxy:fetch-failed]",
+        JSON.stringify({
+          targetUrl,
+          message: error?.message || String(error)
+        })
+      );
+      response.writeHead(502, {
+        "content-type": "text/plain; charset=utf-8",
+        "access-control-allow-origin": "*"
+      });
+      response.end("audio proxy fetch failed");
+      return;
+    }
+
+    const responseHeaders = {
+      "access-control-allow-origin": "*",
+      "accept-ranges": upstreamResponse.headers.get("accept-ranges") || "bytes",
+      "content-type": upstreamResponse.headers.get("content-type") || "audio/mpeg",
+      "cache-control": upstreamResponse.headers.get("cache-control") || "no-store"
+    };
+    const passthroughHeaderNames = [
+      "content-length",
+      "content-range",
+      "etag",
+      "last-modified"
+    ];
+    for (const headerName of passthroughHeaderNames) {
+      const headerValue = upstreamResponse.headers.get(headerName);
+      if (headerValue) {
+        responseHeaders[headerName] = headerValue;
+      }
+    }
+
+    response.writeHead(upstreamResponse.status, responseHeaders);
+    if (request.method === "HEAD" || !upstreamResponse.body) {
+      response.end();
+      return;
+    }
+
+    Readable.fromWeb(upstreamResponse.body).on("error", (error) => {
+      logger.warn("[native:audio-proxy:stream-error]", error?.message || error);
+      response.destroy(error);
+    }).pipe(response);
+  }
+
+  async function ensureAudioProxyServer() {
+    if (audioProxyState.server && audioProxyState.port) {
+      return audioProxyState.port;
+    }
+    if (audioProxyState.pendingStart) {
+      return audioProxyState.pendingStart;
+    }
+
+    audioProxyState.pendingStart = new Promise((resolve, reject) => {
+      const server = http.createServer((request, response) => {
+        void proxyAudioRequest(request, response);
+      });
+      server.on("error", (error) => {
+        if (audioProxyState.server === server) {
+          audioProxyState.server = null;
+          audioProxyState.port = 0;
+        }
+        reject(error);
+      });
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        if (!address || typeof address !== "object") {
+          reject(new Error("audio proxy listen failed"));
+          return;
+        }
+        audioProxyState.server = server;
+        audioProxyState.port = address.port;
+        resolve(address.port);
+      });
+    }).finally(() => {
+      audioProxyState.pendingStart = null;
+    });
+
+    return audioProxyState.pendingStart;
+  }
+
+  async function resolveAudioProxyUrl(inputUrl = "") {
+    const targetUrl = normalizeAssetUrl(String(inputUrl || ""));
+    if (!shouldProxyAudioUrl(targetUrl)) {
+      return targetUrl;
+    }
+    const port = await ensureAudioProxyServer();
+    const token = rememberAudioProxyRoute(targetUrl);
+    return `http://127.0.0.1:${port}/audio/${token}`;
+  }
+
+  function destroyAudioProxyServer() {
+    if (audioProxyState.server) {
+      audioProxyState.server.close();
+    }
+    audioProxyState.server = null;
+    audioProxyState.port = 0;
+    audioProxyState.pendingStart = null;
+    audioProxyState.routeByToken.clear();
   }
 
   async function executeSqlite(sqlText) {
@@ -2693,6 +2871,11 @@ function createNativeApi(options) {
         text
       };
     },
+    "linuxport.resolveaudio": async (payload = {}) => {
+      const rawUrl =
+        payload && typeof payload === "object" ? payload.url || payload.musicurl || "" : "";
+      return resolveAudioProxyUrl(rawUrl);
+    },
     "linuxport.prepareaudio": async (payload = {}) => {
       const rawUrl =
         payload && typeof payload === "object" ? payload.url || payload.musicurl || "" : "";
@@ -3314,6 +3497,7 @@ function createNativeApi(options) {
     appVersion,
     assetRoot,
     cacheRoot,
+    destroyAudioProxyServer,
     extractedRoot,
     generatedPath,
     initialize: sessionRuntime.initialize,

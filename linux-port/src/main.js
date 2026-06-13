@@ -566,6 +566,9 @@ app.on("before-quit", () => {
   if (nativeApi && typeof nativeApi.markAppQuitRequested === "function") {
     nativeApi.markAppQuitRequested();
   }
+  if (nativeApi && typeof nativeApi.destroyAudioProxyServer === "function") {
+    nativeApi.destroyAudioProxyServer();
+  }
 });
 
 app.on("activate", () => {

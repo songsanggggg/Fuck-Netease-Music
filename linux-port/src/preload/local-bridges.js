@@ -434,7 +434,6 @@ function createLocalPopupMenuBridge(options) {
 
 function createLocalAudioBridge(options) {
   const {
-    pathToFileURL,
     safeParseJson,
     runRegisteredCallbacks,
     reportRendererError,
@@ -495,6 +494,7 @@ function createLocalAudioBridge(options) {
   }
 
   let audioElement = null;
+  let preloadAudioElement = null;
   let currentPlayId = "";
   let currentResumeOrPauseId = "";
   let currentSeekId = "";
@@ -921,15 +921,14 @@ function createLocalAudioBridge(options) {
     return audioElement;
   };
 
-  const toPreparedFileUrl = (filePath) => {
-    if (!filePath) {
-      return "";
+  const ensurePreloadAudioElement = () => {
+    if (preloadAudioElement) {
+      return preloadAudioElement;
     }
-    try {
-      return pathToFileURL(String(filePath)).toString();
-    } catch {
-      return "";
-    }
+    preloadAudioElement = document.createElement("audio");
+    preloadAudioElement.preload = "auto";
+    preloadAudioElement.style.display = "none";
+    return preloadAudioElement;
   };
 
   const resolvePreparedPlayableSource = async (payload = {}) => {
@@ -946,13 +945,15 @@ function createLocalAudioBridge(options) {
       return existingTask;
     }
 
-    const prepareTask = invokeNative("linuxport.prepareaudio", [{ url: directUrl }])
-      .then((filePath) => {
-        const localUrl = toPreparedFileUrl(filePath);
-        return localUrl || directUrl;
+    const prepareTask = invokeNative("linuxport.resolveaudio", [{ url: directUrl }])
+      .then((resolvedUrl) => {
+        if (typeof resolvedUrl === "string" && resolvedUrl) {
+          return resolvedUrl;
+        }
+        return directUrl;
       })
       .catch((error) => {
-        reportRendererError("prepare-lossless-audio-failed", {
+        reportRendererError("resolve-stream-audio-failed", {
           message: error?.message || String(error),
           url: directUrl
         });
@@ -1088,15 +1089,19 @@ function createLocalAudioBridge(options) {
       return true;
     },
     "audioplayer.preload": async (_playId, payload = {}) => {
-      const audio = ensureAudioElement();
       const nextUrl = await resolvePreparedPlayableSource(payload);
       if (!nextUrl) {
         return false;
       }
-      audio.preload = "auto";
-      if (!audio.src) {
-        audio.src = nextUrl;
-        audio.load();
+      const preloadAudio = ensurePreloadAudioElement();
+      preloadAudio.preload = "auto";
+      const currentPreloadSrc = preloadAudio.currentSrc || preloadAudio.src || "";
+      if (currentPreloadSrc !== nextUrl) {
+        preloadAudio.pause();
+        preloadAudio.removeAttribute("src");
+        preloadAudio.load();
+        preloadAudio.src = nextUrl;
+        preloadAudio.load();
       }
       return true;
     },
