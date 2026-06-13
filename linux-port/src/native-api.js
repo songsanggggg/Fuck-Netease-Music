@@ -7,7 +7,7 @@ const fsp = require("node:fs/promises");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
-const { Readable } = require("node:stream");
+const { once } = require("node:events");
 const {
   screen,
   shell,
@@ -563,6 +563,9 @@ function createNativeApi(options) {
     pendingStart: null,
     routeByToken: new Map()
   };
+  const AUDIO_PROXY_ROUTE_LIMIT = 128;
+  const AUDIO_PROXY_WARMUP_BYTES = 2 * 1024 * 1024;
+  const AUDIO_PROXY_RESUME_ATTEMPTS = 3;
   const playerUrlResponseCache = new Map();
   const playerRuntimeState = {
     info: null,
@@ -1549,21 +1552,405 @@ function createNativeApi(options) {
     return String(token || "").replace(/[^a-zA-Z0-9_-]/g, "");
   }
 
-  function rememberAudioProxyRoute(targetUrl = "") {
+  function safeJsonObjectParse(input) {
+    return safeJsonParse(String(input || ""), {});
+  }
+
+  async function buildAudioProxyHeaders(targetUrl = "", options = {}) {
+    const {
+      extHeaderText = "",
+      accept = "audio/*,*/*;q=0.9",
+      range = "",
+      extraHeaders = {}
+    } = options;
+    const normalizedUrl = normalizeAssetUrl(String(targetUrl || ""));
+    const headers = {
+      Origin: "https://music.163.com",
+      origin: "https://music.163.com",
+      Referer: "https://music.163.com/",
+      referer: "https://music.163.com/",
+      Accept: accept
+    };
+    const extHeaders = safeJsonObjectParse(extHeaderText);
+    if (extHeaders && typeof extHeaders === "object" && !Array.isArray(extHeaders)) {
+      for (const [key, value] of Object.entries(extHeaders)) {
+        if (value !== undefined && value !== null && value !== "") {
+          headers[key] = String(value);
+        }
+      }
+    }
+    for (const [key, value] of Object.entries(extraHeaders)) {
+      if (value !== undefined && value !== null && value !== "") {
+        headers[key] = String(value);
+      }
+    }
+    if (range) {
+      headers.Range = range;
+    }
+    if (normalizedUrl) {
+      const cookies = await session.defaultSession.cookies.get({ url: normalizedUrl });
+      if (cookies.length > 0) {
+        headers.Cookie = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+      }
+    }
+    return headers;
+  }
+
+  function parseContentRangeHeader(value = "") {
+    const normalized = String(value || "").trim();
+    const matched = normalized.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+    if (!matched) {
+      return null;
+    }
+    return {
+      start: Number(matched[1]),
+      end: Number(matched[2]),
+      total: matched[3] === "*" ? 0 : Number(matched[3])
+    };
+  }
+
+  function parseByteRangeHeader(value = "") {
+    const normalized = String(value || "").trim();
+    const matched = normalized.match(/^bytes=(\d*)-(\d*)$/i);
+    if (!matched) {
+      return null;
+    }
+    const startText = matched[1];
+    const endText = matched[2];
+    if (!startText && !endText) {
+      return null;
+    }
+    if (!startText) {
+      return {
+        suffixLength: Number(endText),
+        start: null,
+        end: null
+      };
+    }
+    return {
+      start: Number(startText),
+      end: endText ? Number(endText) : null,
+      suffixLength: null
+    };
+  }
+
+  function buildRangeHeader(start, end = null) {
+    if (!Number.isFinite(start) || start < 0) {
+      return "";
+    }
+    if (Number.isFinite(end) && end >= start) {
+      return `bytes=${start}-${end}`;
+    }
+    return `bytes=${start}-`;
+  }
+
+  function shouldUseWarmupBuffer(rangeRequest, route) {
+    if (!route?.warmupBuffer || route.warmupBuffer.length <= 0) {
+      return false;
+    }
+    if (!rangeRequest) {
+      return true;
+    }
+    if (!Number.isFinite(rangeRequest.start) || rangeRequest.start < 0) {
+      return false;
+    }
+    return rangeRequest.start < route.warmupBuffer.length;
+  }
+
+  function getRouteResponseMetadata(route = {}, upstreamResponse = null) {
+    const upstreamContentRange = upstreamResponse?.headers?.get("content-range") || "";
+    const parsedUpstreamRange = parseContentRangeHeader(upstreamContentRange);
+    const totalBytesFromLength = Number(upstreamResponse?.headers?.get("content-length") || 0);
+    return {
+      totalBytes:
+        route.totalBytes ||
+        parsedUpstreamRange?.total ||
+        (upstreamResponse?.status === 200 ? totalBytesFromLength : 0),
+      contentType:
+        route.contentType || upstreamResponse?.headers?.get("content-type") || "audio/mpeg",
+      acceptRanges:
+        route.acceptRanges || upstreamResponse?.headers?.get("accept-ranges") || "bytes",
+      cacheControl:
+        route.cacheControl || upstreamResponse?.headers?.get("cache-control") || "no-store",
+      etag: route.etag || upstreamResponse?.headers?.get("etag") || "",
+      lastModified: route.lastModified || upstreamResponse?.headers?.get("last-modified") || ""
+    };
+  }
+
+  async function warmAudioProxyRoute(route = null) {
+    if (!route || route.warmupState === "ready" || route.warmupState === "failed") {
+      return route;
+    }
+    if (route.warmupPromise) {
+      return route.warmupPromise;
+    }
+    route.warmupState = "warming";
+    route.warmupPromise = (async () => {
+      const headers = await buildAudioProxyHeaders(route.targetUrl, {
+        extHeaderText: route.extHeaderText,
+        range: buildRangeHeader(0, AUDIO_PROXY_WARMUP_BYTES - 1)
+      });
+      const warmupResponse = await fetchWithRetry(
+        route.targetUrl,
+        {
+          method: "GET",
+          headers
+        },
+        {
+          apiPath: "/audio-proxy/warmup",
+          loggerRef: logger
+        }
+      );
+      if (!(warmupResponse.ok || warmupResponse.status === 206)) {
+        throw new Error(`audio warmup failed: ${warmupResponse.status}`);
+      }
+      const contentRange = parseContentRangeHeader(warmupResponse.headers.get("content-range"));
+      const buffer = Buffer.from(await warmupResponse.arrayBuffer());
+      route.warmupBuffer = buffer;
+      route.contentType = warmupResponse.headers.get("content-type") || route.contentType || "audio/mpeg";
+      route.acceptRanges = warmupResponse.headers.get("accept-ranges") || route.acceptRanges || "bytes";
+      route.cacheControl = warmupResponse.headers.get("cache-control") || route.cacheControl || "no-store";
+      route.etag = warmupResponse.headers.get("etag") || route.etag || "";
+      route.lastModified = warmupResponse.headers.get("last-modified") || route.lastModified || "";
+      route.totalBytes =
+        contentRange?.total ||
+        (warmupResponse.status === 200
+          ? Number(warmupResponse.headers.get("content-length") || buffer.length || 0)
+          : route.totalBytes || 0);
+      route.warmupState = "ready";
+      return route;
+    })().catch((error) => {
+      route.warmupBuffer = null;
+      route.warmupState = "failed";
+      logger.warn(
+        "[native:audio-proxy:warmup-failed]",
+        JSON.stringify({
+          targetUrl: route.targetUrl,
+          message: error?.message || String(error)
+        })
+      );
+      return route;
+    }).finally(() => {
+      route.warmupPromise = null;
+    });
+    return route.warmupPromise;
+  }
+
+  function rememberAudioProxyRoute(targetUrl = "", options = {}) {
     const token = hashString(`${targetUrl}:${Date.now()}:${Math.random()}`);
     audioProxyState.routeByToken.set(token, {
       targetUrl,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      extHeaderText: String(options.extHeaderText || ""),
+      warmupBuffer: null,
+      warmupPromise: null,
+      warmupState: "idle",
+      totalBytes: 0,
+      contentType: "",
+      acceptRanges: "",
+      cacheControl: "",
+      etag: "",
+      lastModified: ""
     });
-    if (audioProxyState.routeByToken.size > 256) {
+    const route = audioProxyState.routeByToken.get(token);
+    if (route) {
+      void warmAudioProxyRoute(route);
+    }
+    if (audioProxyState.routeByToken.size > AUDIO_PROXY_ROUTE_LIMIT) {
       const entries = [...audioProxyState.routeByToken.entries()].sort(
         (left, right) => left[1].createdAt - right[1].createdAt
       );
-      for (const [staleToken] of entries.slice(0, entries.length - 256)) {
+      for (const [staleToken] of entries.slice(0, entries.length - AUDIO_PROXY_ROUTE_LIMIT)) {
         audioProxyState.routeByToken.delete(staleToken);
       }
     }
     return token;
+  }
+
+  async function writeBufferToResponse(response, buffer) {
+    if (!buffer || buffer.length <= 0 || response.destroyed) {
+      return;
+    }
+    if (!response.write(buffer)) {
+      await once(response, "drain");
+    }
+  }
+
+  async function pumpUpstreamBodyToResponse(upstreamResponse, response) {
+    const reader = upstreamResponse.body?.getReader?.();
+    if (!reader) {
+      return { bytesWritten: 0, completed: true };
+    }
+    let bytesWritten = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          return { bytesWritten, completed: true };
+        }
+        if (response.destroyed) {
+          return { bytesWritten, completed: false };
+        }
+        const chunk = Buffer.from(value);
+        bytesWritten += chunk.length;
+        await writeBufferToResponse(response, chunk);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  async function fetchAudioProxySegment(route, start, end = null, accept = "audio/*,*/*;q=0.9") {
+    const headers = await buildAudioProxyHeaders(route.targetUrl, {
+      extHeaderText: route.extHeaderText,
+      accept,
+      range: buildRangeHeader(start, end)
+    });
+    return fetchWithRetry(
+      route.targetUrl,
+      {
+        method: "GET",
+        headers
+      },
+      {
+        apiPath: "/audio-proxy",
+        loggerRef: logger
+      }
+    );
+  }
+
+  async function streamAudioProxyRequest(request, response, route, rangeRequest) {
+    const shouldUseWarmup = shouldUseWarmupBuffer(rangeRequest, route);
+    const rangeStart = Number.isFinite(rangeRequest?.start) ? rangeRequest.start : 0;
+    const requestedEnd = Number.isFinite(rangeRequest?.end) ? rangeRequest.end : null;
+    let totalBytes = Number(route.totalBytes || 0);
+    let responseStarted = false;
+    let cursor = rangeStart;
+    const responseMetadata = {
+      totalBytes,
+      contentType: route.contentType || "audio/mpeg",
+      acceptRanges: route.acceptRanges || "bytes",
+      cacheControl: route.cacheControl || "no-store",
+      etag: route.etag || "",
+      lastModified: route.lastModified || ""
+    };
+
+    const startResponseIfNeeded = (metadata = responseMetadata) => {
+      if (responseStarted) {
+        return;
+      }
+      responseMetadata.totalBytes = metadata.totalBytes || responseMetadata.totalBytes || 0;
+      responseMetadata.contentType = metadata.contentType || responseMetadata.contentType;
+      responseMetadata.acceptRanges = metadata.acceptRanges || responseMetadata.acceptRanges;
+      responseMetadata.cacheControl = metadata.cacheControl || responseMetadata.cacheControl;
+      responseMetadata.etag = metadata.etag || responseMetadata.etag;
+      responseMetadata.lastModified = metadata.lastModified || responseMetadata.lastModified;
+      totalBytes = responseMetadata.totalBytes;
+      const resolvedEnd =
+        Number.isFinite(requestedEnd) && requestedEnd >= rangeStart
+          ? requestedEnd
+          : totalBytes > 0
+            ? totalBytes - 1
+            : null;
+      const headers = {
+        "access-control-allow-origin": "*",
+        "accept-ranges": responseMetadata.acceptRanges || "bytes",
+        "content-type": responseMetadata.contentType || "audio/mpeg",
+        "cache-control": responseMetadata.cacheControl || "no-store"
+      };
+      if (responseMetadata.etag) {
+        headers.etag = responseMetadata.etag;
+      }
+      if (responseMetadata.lastModified) {
+        headers["last-modified"] = responseMetadata.lastModified;
+      }
+      let statusCode = 200;
+      if (rangeRequest) {
+        statusCode = 206;
+        if (totalBytes > 0 && Number.isFinite(resolvedEnd)) {
+          headers["content-range"] = `bytes ${rangeStart}-${resolvedEnd}/${totalBytes}`;
+          headers["content-length"] = String(Math.max(0, resolvedEnd - rangeStart + 1));
+        }
+      } else if (totalBytes > 0) {
+        headers["content-length"] = String(totalBytes);
+      }
+      response.writeHead(statusCode, headers);
+      responseStarted = true;
+    };
+
+    if (shouldUseWarmup) {
+      const warmupStart = rangeStart;
+      const warmupEndExclusive = Number.isFinite(requestedEnd)
+        ? Math.min(route.warmupBuffer.length, requestedEnd + 1)
+        : route.warmupBuffer.length;
+      if (warmupEndExclusive > warmupStart) {
+        startResponseIfNeeded(responseMetadata);
+        await writeBufferToResponse(response, route.warmupBuffer.subarray(warmupStart, warmupEndExclusive));
+        cursor = warmupEndExclusive;
+      }
+      if (Number.isFinite(requestedEnd) && cursor > requestedEnd) {
+        response.end();
+        return;
+      }
+    }
+
+    if (request.method === "HEAD") {
+      if (!responseStarted) {
+        const upstreamResponse = await fetchAudioProxySegment(
+          route,
+          rangeStart,
+          requestedEnd,
+          request.headers.accept || "audio/*,*/*;q=0.9"
+        );
+        startResponseIfNeeded(getRouteResponseMetadata(route, upstreamResponse));
+      }
+      response.end();
+      return;
+    }
+
+    let attempt = 0;
+    while (!response.destroyed) {
+      if (Number.isFinite(requestedEnd) && cursor > requestedEnd) {
+        break;
+      }
+      let upstreamResponse = null;
+      try {
+        upstreamResponse = await fetchAudioProxySegment(
+          route,
+          cursor,
+          requestedEnd,
+          request.headers.accept || "audio/*,*/*;q=0.9"
+        );
+        if (!(upstreamResponse.ok || upstreamResponse.status === 206)) {
+          throw new Error(`audio proxy upstream status ${upstreamResponse.status}`);
+        }
+        startResponseIfNeeded(getRouteResponseMetadata(route, upstreamResponse));
+        const result = await pumpUpstreamBodyToResponse(upstreamResponse, response);
+        cursor += result.bytesWritten;
+        if (result.completed) {
+          break;
+        }
+        throw new Error("audio proxy upstream interrupted");
+      } catch (error) {
+        attempt += 1;
+        if (attempt >= AUDIO_PROXY_RESUME_ATTEMPTS || response.destroyed) {
+          throw error;
+        }
+        logger.warn(
+          "[native:audio-proxy:resume]",
+          JSON.stringify({
+            targetUrl: route.targetUrl,
+            cursor,
+            attempt,
+            message: error?.message || String(error)
+          })
+        );
+      }
+    }
+
+    if (!response.destroyed) {
+      response.end();
+    }
   }
 
   async function proxyAudioRequest(request, response) {
@@ -1579,80 +1966,68 @@ function createNativeApi(options) {
       return;
     }
 
-    const targetUrl = route.targetUrl;
-    const headers = {
-      Origin: "https://music.163.com",
-      origin: "https://music.163.com",
-      Referer: "https://music.163.com/",
-      referer: "https://music.163.com/",
-      Accept: request.headers.accept || "audio/*,*/*;q=0.9"
-    };
-    if (request.headers.range) {
-      headers.Range = request.headers.range;
-    }
-    const cookies = await session.defaultSession.cookies.get({ url: targetUrl });
-    if (cookies.length > 0) {
-      headers.Cookie = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
-    }
-
-    let upstreamResponse;
     try {
-      upstreamResponse = await fetchWithRetry(
-        targetUrl,
-        {
-          method: request.method || "GET",
-          headers
-        },
-        {
-          apiPath: "/audio-proxy",
-          loggerRef: logger
+      await warmAudioProxyRoute(route);
+      const rangeRequest = parseByteRangeHeader(request.headers.range || "");
+      if (rangeRequest && Number.isFinite(rangeRequest.suffixLength)) {
+        const headers = await buildAudioProxyHeaders(route.targetUrl, {
+          extHeaderText: route.extHeaderText,
+          accept: request.headers.accept || "audio/*,*/*;q=0.9",
+          range: request.headers.range || ""
+        });
+        const upstreamResponse = await fetchWithRetry(
+          route.targetUrl,
+          {
+            method: request.method || "GET",
+            headers
+          },
+          {
+            apiPath: "/audio-proxy",
+            loggerRef: logger
+          }
+        );
+        const metadata = getRouteResponseMetadata(route, upstreamResponse);
+        const responseHeaders = {
+          "access-control-allow-origin": "*",
+          "accept-ranges": metadata.acceptRanges || "bytes",
+          "content-type": metadata.contentType || "audio/mpeg",
+          "cache-control": metadata.cacheControl || "no-store"
+        };
+        for (const headerName of ["content-length", "content-range", "etag", "last-modified"]) {
+          const headerValue = upstreamResponse.headers.get(headerName);
+          if (headerValue) {
+            responseHeaders[headerName] = headerValue;
+          }
         }
-      );
+        response.writeHead(upstreamResponse.status, responseHeaders);
+        if (request.method === "HEAD" || !upstreamResponse.body) {
+          response.end();
+          return;
+        }
+        await pumpUpstreamBodyToResponse(upstreamResponse, response);
+        response.end();
+        return;
+      }
+
+      await streamAudioProxyRequest(request, response, route, rangeRequest);
     } catch (error) {
       logger.warn(
         "[native:audio-proxy:fetch-failed]",
         JSON.stringify({
-          targetUrl,
+          targetUrl: route.targetUrl,
           message: error?.message || String(error)
         })
       );
-      response.writeHead(502, {
-        "content-type": "text/plain; charset=utf-8",
-        "access-control-allow-origin": "*"
-      });
-      response.end("audio proxy fetch failed");
-      return;
-    }
-
-    const responseHeaders = {
-      "access-control-allow-origin": "*",
-      "accept-ranges": upstreamResponse.headers.get("accept-ranges") || "bytes",
-      "content-type": upstreamResponse.headers.get("content-type") || "audio/mpeg",
-      "cache-control": upstreamResponse.headers.get("cache-control") || "no-store"
-    };
-    const passthroughHeaderNames = [
-      "content-length",
-      "content-range",
-      "etag",
-      "last-modified"
-    ];
-    for (const headerName of passthroughHeaderNames) {
-      const headerValue = upstreamResponse.headers.get(headerName);
-      if (headerValue) {
-        responseHeaders[headerName] = headerValue;
+      if (!response.headersSent) {
+        response.writeHead(502, {
+          "content-type": "text/plain; charset=utf-8",
+          "access-control-allow-origin": "*"
+        });
+        response.end("audio proxy fetch failed");
+        return;
       }
-    }
-
-    response.writeHead(upstreamResponse.status, responseHeaders);
-    if (request.method === "HEAD" || !upstreamResponse.body) {
-      response.end();
-      return;
-    }
-
-    Readable.fromWeb(upstreamResponse.body).on("error", (error) => {
-      logger.warn("[native:audio-proxy:stream-error]", error?.message || error);
       response.destroy(error);
-    }).pipe(response);
+    }
   }
 
   async function ensureAudioProxyServer() {
@@ -1691,13 +2066,16 @@ function createNativeApi(options) {
     return audioProxyState.pendingStart;
   }
 
-  async function resolveAudioProxyUrl(inputUrl = "") {
-    const targetUrl = normalizeAssetUrl(String(inputUrl || ""));
+  async function resolveAudioProxyUrl(payload = {}) {
+    const normalizedPayload = payload && typeof payload === "object" ? payload : {};
+    const targetUrl = normalizeAssetUrl(String(normalizedPayload.url || normalizedPayload.musicurl || ""));
     if (!shouldProxyAudioUrl(targetUrl)) {
       return targetUrl;
     }
     const port = await ensureAudioProxyServer();
-    const token = rememberAudioProxyRoute(targetUrl);
+    const token = rememberAudioProxyRoute(targetUrl, {
+      extHeaderText: normalizedPayload.extHeader || ""
+    });
     return `http://127.0.0.1:${port}/audio/${token}`;
   }
 
@@ -2872,9 +3250,7 @@ function createNativeApi(options) {
       };
     },
     "linuxport.resolveaudio": async (payload = {}) => {
-      const rawUrl =
-        payload && typeof payload === "object" ? payload.url || payload.musicurl || "" : "";
-      return resolveAudioProxyUrl(rawUrl);
+      return resolveAudioProxyUrl(payload);
     },
     "linuxport.prepareaudio": async (payload = {}) => {
       const rawUrl =

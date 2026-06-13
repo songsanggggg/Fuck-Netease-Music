@@ -493,6 +493,18 @@ function createLocalAudioBridge(options) {
     return url.replace(/^http:\/\//i, "https://");
   }
 
+  function buildPreparedPlayableSourceCacheKey(payload = {}, directUrl = "") {
+    if (!directUrl) {
+      return "";
+    }
+    const extHeader =
+      payload && typeof payload.extHeader === "string" ? payload.extHeader : "";
+    return JSON.stringify({
+      url: directUrl,
+      extHeader
+    });
+  }
+
   let audioElement = null;
   let preloadAudioElement = null;
   let currentPlayId = "";
@@ -940,12 +952,13 @@ function createLocalAudioBridge(options) {
       return directUrl;
     }
 
-    const existingTask = preparedPlayableSourceCache.get(directUrl);
+    const cacheKey = buildPreparedPlayableSourceCacheKey(payload, directUrl);
+    const existingTask = preparedPlayableSourceCache.get(cacheKey);
     if (existingTask) {
       return existingTask;
     }
 
-    const prepareTask = invokeNative("linuxport.resolveaudio", [{ url: directUrl }])
+    const prepareTask = invokeNative("linuxport.resolveaudio", [{ ...payload, url: directUrl }])
       .then((resolvedUrl) => {
         if (typeof resolvedUrl === "string" && resolvedUrl) {
           return resolvedUrl;
@@ -957,14 +970,14 @@ function createLocalAudioBridge(options) {
           message: error?.message || String(error),
           url: directUrl
         });
-        preparedPlayableSourceCache.delete(directUrl);
+        preparedPlayableSourceCache.delete(cacheKey);
         return directUrl;
       });
 
-    preparedPlayableSourceCache.set(directUrl, prepareTask);
+    preparedPlayableSourceCache.set(cacheKey, prepareTask);
     const resolved = await prepareTask;
     if (resolved === directUrl) {
-      preparedPlayableSourceCache.delete(directUrl);
+      preparedPlayableSourceCache.delete(cacheKey);
     }
     return resolved;
   };
